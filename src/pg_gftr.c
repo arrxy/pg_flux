@@ -67,15 +67,38 @@ typedef struct GftrState
 	 */
 	PlanState *child;
 	/**
-	 * A MemoryContext is a memory pool. 
+	 * A MemoryContext is a memory pool. Everything you palloc (palloc is Postgres' own memory management system) goes into the current context, and when that context is reset or deleted, all of it is freed at once. You don't have to free each allocation individually. How it works inside: the pool calls malloc for big blocks, say 8 KB at a time. Each palloc then hands out the next slice of the current block: if the current block is full, it calls malloc for a new block and continues handing out slices from the new block.
 	 */
 	MemoryContext context;
+	/**
+	 * MemoryContextCallback is a request of the form "when this memory context is reset or deleted, call this function first". It is one node in a linked list of callbacks associated with the memory context.
+	 */
 	MemoryContextCallback cleanup;
-	int key_attno;
-	int ncols;
-	int *attnos;
+	/**
+	 * key_attno: key_attno is the column number of the GROUP BY key, ncols is the number of distinct value columns the aggregates need, and attnos is the array of column numbers for those value columns.
+	 * CREATE TABLE sales (region int, store int, qty int, price int, discount int);
+	 * SELECT region, sum(price), max(qty), min(price)
+	   FROM sales GROUP BY region;
+	 * child row:   region | store | qty | price | discount
+		   attno:      1   |   2   |  3  |   4   |    5
+	 * key_attno = 1 (region)
+	 * ncols = 3 (sum(price), max(qty), min(price))
+	 * attnos = {4, 3, 4} (price, qty, price)
+	 */
+	int key_attno; // Column number (1-based) of the GROUP BY key in the child's output row
+	int ncols; // How many distinct value columns the aggregates need
+	int *attnos; // Array of ncols column numbers, telling you where each of those value columns sits in the child's row
+	/**
+	 * ops is a list of lists. Each inner list is a pair of ints: (Gftr_op, attno)
+	 * SELECT region, count(*), sum(price), max(qty), min(price) FROM sales GROUP BY region;
+	 * ops = [ 
+	 * [COUNT_STAR, -1],    count(*)
+	 * [SUM,         0],    sum(price) → columns[0]
+	 * [MAX,         1],    max(qty)   → columns[1]
+	 * [MIN,         0] ]   min(price) → columns[0]
+	 */
 	List *ops;
-	GftrInput input;
+	GftrInput input; // Go to it's .h
 	int capacity;
 	int max_rows;
 	GftrResult result;
