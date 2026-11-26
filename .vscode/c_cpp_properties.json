@@ -1,0 +1,14 @@
+{
+  "configurations": [
+    {
+      "name": "pg18",
+      "includePath": [
+        "${workspaceFolder}/src",
+        "/opt/homebrew/opt/postgresql@18/include/postgresql/server"
+      ],
+      "cStandard": "c11",
+      "intelliSenseMode": "macos-clang-arm64"
+    }
+  ],
+  "version": 4
+}

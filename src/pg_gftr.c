@@ -34,19 +34,41 @@ PG_FUNCTION_INFO_V1(pg_gftr_version);
 void _PG_init(void);
 void _PG_fini(void);
 
+/**
+ * ENUM representing supported aggregate operations.
+ */
 enum GftrOp
 {
-	GFTR_COUNT_STAR = 1,
-	GFTR_COUNT,
-	GFTR_SUM,
-	GFTR_MIN,
-	GFTR_MAX
+	GFTR_COUNT_STAR = 1, // COUNT(*)
+	GFTR_COUNT,          // COUNT(column)
+	GFTR_SUM,            // SUM(column)
+	GFTR_MIN,            // MIN(column)
+	GFTR_MAX             // MAX(column)
 };
 
+/**
+ * GftrState holds the runtime state of one pg_gftr custom scan node. This is equivalent to in OS terms, GftrState is the Process Control Block (PCB).
+ */
 typedef struct GftrState
 {
+	/**
+	 * SQL text
+  		→ parser    → Query tree  (what you asked for)
+  		→ planner   → Plan tree   (how to do it)
+  		→ executor  → PlanState tree (one node per Plan node, holding run-time state)
+	 * CustomScanState stores ScanState which stores PlanState.
+	 * ScanState is PlanState plus what this node is reading (a table and a cursor into it) and a slot for the current row.
+	 * CustomScanState extends ScanState with additional fields for custom scan nodes.
+	 * CustomScanState is ScanState plus "my code lives in an extension" (methods), It means that PostgreSQL doesn't contain your node's code. Your .so does, and methods is how PostgreSQL finds that code., "here are my children" (custom_ps), custom node can have any number of children, and what I support (flags, pscan_len, slotOps).
+	 */
 	CustomScanState css;
+	/**
+	 * Pointer to the child PlanState of this custom scan node. We are doing aggregation and aggregation just has 1 child.
+	 */
 	PlanState *child;
+	/**
+	 * A MemoryContext is a memory pool. 
+	 */
 	MemoryContext context;
 	MemoryContextCallback cleanup;
 	int key_attno;
