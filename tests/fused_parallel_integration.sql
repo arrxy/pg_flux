@@ -55,6 +55,7 @@ BEGIN
     DROP TABLE fused_parallel_expected, fused_parallel_actual;
 END $$;
 
+SET pg_gftr.join_backend = 'cuda';
 SET pg_gftr.fused_force = on;
 SET pg_gftr.fused_parallel = on;
 SELECT pg_temp.assert_parallel_fused(
@@ -63,6 +64,11 @@ SELECT pg_temp.assert_parallel_fused(
     'SELECT count(*), d.grp, sum(f.value) FROM fused_parallel_fact f JOIN fused_parallel_dim d USING (id) WHERE f.value IS NULL GROUP BY d.grp', true);
 SELECT pg_temp.assert_parallel_fused(
     'SELECT d.grp, count(*) FROM fused_parallel_fact f JOIN fused_parallel_dim d USING (id) GROUP BY d.grp', true);
+
+SET parallel_leader_participation = off;
+SELECT pg_temp.assert_parallel_fused(
+    'SELECT d.grp, count(*), sum(f.value) FROM fused_parallel_fact f JOIN fused_parallel_dim d USING (id) GROUP BY d.grp', true);
+RESET parallel_leader_participation;
 
 SET max_parallel_workers_per_gather = 0;
 SELECT pg_temp.assert_parallel_fused(
