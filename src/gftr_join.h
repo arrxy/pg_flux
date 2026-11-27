@@ -29,6 +29,12 @@ typedef struct GftrJoinTiming
 int gftr_join_cpu_build(const int32_t *keys, int32_t count, size_t budget,
 						GftrJoinBuild **out, GftrJoinTiming *timing,
 						char error[GFTR_ERROR_SIZE]);
+/* Build a lookup of nonnegative group indices instead of build row indices. */
+int gftr_join_cpu_build_groups(const int32_t *keys, const int32_t *groups,
+							   int32_t count, size_t budget, GftrJoinBuild **out,
+							   GftrJoinTiming *timing, char error[GFTR_ERROR_SIZE]);
+/* Return -1 when the key has no match. */
+int32_t gftr_join_cpu_lookup(const GftrJoinBuild *build, int32_t key);
 int gftr_join_cpu_probe(GftrJoinBuild *build, const int32_t *keys,
 						const uint8_t *valid, int32_t count, int32_t *matches,
 						GftrJoinTiming *timing, char error[GFTR_ERROR_SIZE]);

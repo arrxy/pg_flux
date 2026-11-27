@@ -47,15 +47,28 @@ def main():
                 subprocess.run(cmd, input=script, text=True, stdout=log,
                                stderr=subprocess.STDOUT, check=True)
             print(f'{args.backend}/{mode}: PostgreSQL aggregation integration tests passed')
-            if mode == 'gftr' and args.backend == 'cuda':
+            if mode == 'gftr':
                 with (work / 'join.log').open('w') as log:
-                    subprocess.run([*cmd, '-f', str(root / 'tests' / 'join_integration.sql')],
+                    subprocess.run([*cmd, '-v', 'backend=cpu', '-f', str(root / 'tests' / 'join_integration.sql')],
                                    stdout=log, stderr=subprocess.STDOUT, check=True)
-                print(f'{args.backend}: PostgreSQL join integration tests passed')
-                with (work / 'resident.log').open('w') as log:
-                    subprocess.run([*cmd, '-f', str(root / 'tests' / 'resident_integration.sql')],
+                print('CPU join integration tests passed')
+                with (work / 'fused.log').open('w') as log:
+                    subprocess.run([*cmd, '-f', str(root / 'tests' / 'fused_integration.sql')],
                                    stdout=log, stderr=subprocess.STDOUT, check=True)
-                print('CUDA resident SQL integration tests passed')
+                print('PostgreSQL fused join integration tests passed')
+                with (work / 'fused_parallel.log').open('w') as log:
+                    subprocess.run([*cmd, '-f', str(root / 'tests' / 'fused_parallel_integration.sql')],
+                                   stdout=log, stderr=subprocess.STDOUT, check=True)
+                print('PostgreSQL parallel fused join integration tests passed')
+                if args.backend == 'cuda':
+                    with (work / 'join-cuda.log').open('w') as log:
+                        subprocess.run([*cmd, '-f', str(root / 'tests' / 'join_integration.sql')],
+                                       stdout=log, stderr=subprocess.STDOUT, check=True)
+                    print('CUDA join integration tests passed')
+                    with (work / 'resident.log').open('w') as log:
+                        subprocess.run([*cmd, '-f', str(root / 'tests' / 'resident_integration.sql')],
+                                       stdout=log, stderr=subprocess.STDOUT, check=True)
+                    print('CUDA resident SQL integration tests passed')
         if args.benchmark_smoke:
             connection = f'host={work} user={getpass.getuser()} dbname=gftr_test_gftr'
             subprocess.run(['python3', str(root / 'bench' / 'benchmark.py'),

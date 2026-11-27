@@ -6,6 +6,7 @@
 #include "catalog/pg_type_d.h"
 #include "commands/explain.h"
 #include "commands/explain_format.h"
+#include "common/int.h"
 #include "executor/executor.h"
 #include "miscadmin.h"
 #include "nodes/extensible.h"
@@ -20,6 +21,7 @@
 #include "utils/memutils.h"
 
 #include "gftr_join.h"
+#include "pg_gftr_fused.h"
 
 #define MIB ((size_t) 1024 * 1024)
 #define JOIN_MIN_BUILD_CAPACITY 4096
@@ -30,6 +32,12 @@ typedef enum JoinSide
 	JOIN_PROBE,
 	JOIN_BUILD
 } JoinSide;
+
+typedef enum JoinBackend
+{
+	JOIN_CUDA,
+	JOIN_CPU
+} JoinBackend;
 
 typedef enum JoinResultMode
 {
@@ -71,6 +79,7 @@ typedef struct GftrJoinState
 	bool initialized;
 	bool probe_done;
 	bool compact;
+	JoinBackend backend;
 	int device;
 	size_t host_budget;
 	size_t device_budget;
@@ -91,11 +100,18 @@ typedef struct GftrJoinState
 static bool join_enabled;
 static bool join_force;
 static int join_result_mode;
+static int join_backend;
 static int join_min_rows;
 static int join_batch_rows;
 static int join_max_host_mb;
 static int join_max_device_mb;
 static set_join_pathlist_hook_type previous_join_hook;
+
+static const struct config_enum_entry join_backends[] = {
+	{"cuda", JOIN_CUDA, false},
+	{"cpu", JOIN_CPU, false},
+	{NULL, 0, false}
+};
 
 static const struct config_enum_entry join_result_modes[] = {
 	{"auto", JOIN_RESULT_AUTO, false},
@@ -141,6 +157,14 @@ gftr_join_init(void)
 		NULL, &join_enabled, false, PGC_USERSET, 0, NULL, NULL, NULL);
 	DefineCustomBoolVariable("pg_gftr.join_force", "Prefer supported join paths for experiments.",
 		NULL, &join_force, false, PGC_USERSET, 0, NULL, NULL, NULL);
+	DefineCustomEnumVariable("pg_gftr.join_backend", "Batched join backend.",
+		NULL, &join_backend,
+#ifdef GFTR_WITH_CUDA
+		JOIN_CUDA,
+#else
+		JOIN_CPU,
+#endif
+		join_backends, PGC_USERSET, 0, NULL, NULL, NULL);
 	DefineCustomEnumVariable("pg_gftr.join_result_mode", "CUDA match return representation.",
 		NULL, &join_result_mode, JOIN_RESULT_AUTO, join_result_modes, PGC_USERSET, 0, NULL, NULL, NULL);
 	DefineCustomIntVariable("pg_gftr.join_min_rows", "Minimum estimated probe rows unless forced.",
@@ -188,9 +212,11 @@ supported_base(PlannerInfo *root, RelOptInfo *rel)
 		!contain_volatile_functions((Node *) rel->baserestrictinfo);
 }
 
-static void
-join_paths(PlannerInfo *root, RelOptInfo *joinrel, RelOptInfo *outerrel,
-		   RelOptInfo *innerrel, JoinType jointype, JoinPathExtraData *extra)
+static Path *
+make_supported_join_path(PlannerInfo *root, RelOptInfo *joinrel,
+						 RelOptInfo *outerrel, RelOptInfo *innerrel,
+						 JoinType jointype, bool inner_unique,
+						 List *restrictlist, bool fused)
 {
 	Path *probe;
 	Path *build;
@@ -202,31 +228,28 @@ join_paths(PlannerInfo *root, RelOptInfo *joinrel, RelOptInfo *outerrel,
 	ListCell *lc;
 	CustomPath *path;
 
-	if (previous_join_hook)
-		previous_join_hook(root, joinrel, outerrel, innerrel, jointype, extra);
-
-	if (!join_enabled || jointype != JOIN_INNER || !extra->inner_unique ||
-		list_length(extra->restrictlist) != 1 ||
+	if (jointype != JOIN_INNER || !inner_unique ||
+		list_length(restrictlist) != 1 ||
 		!supported_base(root, outerrel) || !supported_base(root, innerrel) ||
 		!bms_is_empty(joinrel->lateral_relids))
-		return;
+		return NULL;
 
 	/* EvalPlanQual and its single-tuple rechecks require native paths. */
 	for (query = root; query != NULL; query = query->parent_root)
 	{
 		if (query->parse->commandType != CMD_SELECT || query->parse->rowMarks ||
 			query->parse->hasModifyingCTE)
-			return;
+			return NULL;
 	}
 
-	rinfo = linitial_node(RestrictInfo, extra->restrictlist);
+	rinfo = linitial_node(RestrictInfo, restrictlist);
 	if (rinfo->pseudoconstant || !IsA(rinfo->clause, OpExpr))
-		return;
+		return NULL;
 
 	op = (OpExpr *) rinfo->clause;
 	if (op->opno != Int4EqualOperator || list_length(op->args) != 2 ||
 		!plain_int4_var(linitial(op->args)) || !plain_int4_var(lsecond(op->args)))
-		return;
+		return NULL;
 
 	probe_key = linitial_node(Var, op->args);
 	build_key = lsecond_node(Var, op->args);
@@ -238,15 +261,15 @@ join_paths(PlannerInfo *root, RelOptInfo *joinrel, RelOptInfo *outerrel,
 		build_key = swap;
 	}
 	if (probe_key->varno != outerrel->relid || build_key->varno != innerrel->relid)
-		return;
+		return NULL;
 
 	probe = outerrel->cheapest_total_path;
 	build = innerrel->cheapest_total_path;
 	if (!probe || !build || probe->param_info || build->param_info ||
 		!list_member(probe->pathtarget->exprs, probe_key) ||
 		!list_member(build->pathtarget->exprs, build_key) ||
-		(!join_force && probe->rows < join_min_rows))
-		return;
+		(!fused && !join_force && probe->rows < join_min_rows))
+		return NULL;
 
 	foreach(lc, joinrel->reltarget->exprs)
 	{
@@ -255,7 +278,7 @@ join_paths(PlannerInfo *root, RelOptInfo *joinrel, RelOptInfo *outerrel,
 		if (!plain_int4_var(expr) ||
 			(!list_member(probe->pathtarget->exprs, expr) &&
 			 !list_member(build->pathtarget->exprs, expr)))
-			return;
+			return NULL;
 	}
 
 	path = makeNode(CustomPath);
@@ -266,23 +289,76 @@ join_paths(PlannerInfo *root, RelOptInfo *joinrel, RelOptInfo *outerrel,
 	path->path.disabled_nodes = build->disabled_nodes + probe->disabled_nodes;
 	/* Provisional constants cover setup and packing until benchmark data is available. */
 	path->path.startup_cost = build->total_cost + probe->startup_cost +
-		1000.0 + build->rows * 2 * cpu_tuple_cost;
+		(!fused && join_backend == JOIN_CUDA ? 1000.0 : 0.0) + build->rows * 2 * cpu_tuple_cost;
 	path->path.total_cost = path->path.startup_cost +
 		probe->total_cost - probe->startup_cost +
 		2 * probe->rows * cpu_tuple_cost + joinrel->rows * cpu_tuple_cost;
-	if (join_force)
+	if (!fused && join_force)
 	{
 		path->path.disabled_nodes = 0;
 		path->path.startup_cost = 0;
 		path->path.total_cost = 0.001;
 	}
 	path->custom_paths = list_make2(probe, build);
-	path->custom_restrictinfo = extra->restrictlist;
+	path->custom_restrictinfo = restrictlist;
 	/* Keep margin below the compact buffer capacity of one eighth. */
 	path->custom_private = list_make3(probe_key, build_key,
 		makeInteger(path->path.rows < 0.10 * probe->rows));
 	path->methods = &join_path_methods;
-	add_path(joinrel, &path->path);
+	return &path->path;
+}
+
+
+static void
+join_paths(PlannerInfo *root, RelOptInfo *joinrel, RelOptInfo *outerrel,
+		   RelOptInfo *innerrel, JoinType jointype, JoinPathExtraData *extra)
+{
+	Path *path;
+
+	if (previous_join_hook)
+		previous_join_hook(root, joinrel, outerrel, innerrel, jointype, extra);
+	if (!join_enabled)
+		return;
+
+	path = make_supported_join_path(root, joinrel, outerrel, innerrel,
+		jointype, extra->inner_unique, extra->restrictlist, false);
+	if (path)
+		add_path(joinrel, path);
+}
+
+Path *
+pg_gftr_fused_join_path(PlannerInfo *root, Path *native_path)
+{
+	JoinPath *join;
+
+	/* A Gather can supply a uniqueness proof, but its worker paths cannot
+	 * be executed as serial children. Build fresh children from the base
+	 * relations after rechecking the same join restrictions. */
+	for (;;)
+	{
+		if (IsA(native_path, ProjectionPath))
+			native_path = ((ProjectionPath *) native_path)->subpath;
+		else if (IsA(native_path, GatherPath))
+			native_path = ((GatherPath *) native_path)->subpath;
+		else if (IsA(native_path, GatherMergePath))
+			native_path = ((GatherMergePath *) native_path)->subpath;
+		else
+			break;
+	}
+	if (!IsA(native_path, HashPath) && !IsA(native_path, MergePath) &&
+		!IsA(native_path, NestPath))
+		return NULL;
+
+	join = (JoinPath *) native_path;
+	/* Nested loops can push join restrictions into a parameterized child.
+	 * Reject any such child before switching to unparameterized paths. */
+	if (native_path->param_info || join->outerjoinpath->param_info ||
+		join->innerjoinpath->param_info)
+		return NULL;
+
+	return make_supported_join_path(root, native_path->parent,
+		join->outerjoinpath->parent, join->innerjoinpath->parent,
+		join->jointype, join->inner_unique, join->joinrestrictinfo, true);
 }
 
 static Plan *
@@ -347,7 +423,10 @@ join_cleanup(void *arg)
 {
 	GftrJoinState *state = arg;
 
-	gftr_join_cuda_free(state->build);
+	if (state->backend == JOIN_CPU)
+		gftr_join_cpu_free(state->build);
+	else
+		gftr_join_cuda_free(state->build);
 	state->build = NULL;
 }
 
@@ -362,8 +441,10 @@ join_begin(CustomScanState *node, EState *estate, int eflags)
 	int side;
 
 	state->context = estate->es_query_cxt;
-	state->compact = join_result_mode == JOIN_RESULT_COMPACT ||
-		(join_result_mode == JOIN_RESULT_AUTO && intVal(lfourth(plan->custom_private)));
+	state->backend = join_backend;
+	state->compact = state->backend == JOIN_CUDA &&
+		(join_result_mode == JOIN_RESULT_COMPACT ||
+		 (join_result_mode == JOIN_RESULT_AUTO && intVal(lfourth(plan->custom_private))));
 	state->profile_output = estate->es_instrument != 0;
 	state->device = atoi(GetConfigOption("pg_gftr.device", false, false));
 	state->batch_rows = join_batch_rows;
@@ -483,21 +564,11 @@ elapsed_ms(instr_time start)
 }
 
 static void
-load_build(GftrJoinState *state)
+load_build_rows(GftrJoinState *state)
 {
 	JoinInput *build = &state->inputs[JOIN_BUILD];
-	JoinInput *probe = &state->inputs[JOIN_PROBE];
 	TupleTableSlot *slot;
 	instr_time start;
-	int status;
-	char error[GFTR_ERROR_SIZE] = {0};
-
-	state->probe_bytes = (size_t) state->batch_rows *
-		(input_row_bytes(probe) + sizeof(uint8) + sizeof(int32));
-	if (state->compact)
-		state->probe_bytes += (size_t) state->batch_rows + sizeof(uint32);
-	if (state->probe_bytes >= state->host_budget)
-		join_host_limit();
 
 	INSTR_TIME_SET_CURRENT(start);
 	for (;;)
@@ -519,15 +590,40 @@ load_build(GftrJoinState *state)
 	}
 	state->build_pack_ms = elapsed_ms(start);
 	state->initialized = true;
+}
+
+static void
+load_build(GftrJoinState *state)
+{
+	JoinInput *build = &state->inputs[JOIN_BUILD];
+	JoinInput *probe = &state->inputs[JOIN_PROBE];
+	size_t remaining_host;
+	int status;
+	char error[GFTR_ERROR_SIZE] = {0};
+
+	state->probe_bytes = (size_t) state->batch_rows *
+		(input_row_bytes(probe) + sizeof(uint8) + sizeof(int32));
+	if (state->compact)
+		state->probe_bytes += (size_t) state->batch_rows + sizeof(uint32);
+	if (state->probe_bytes >= state->host_budget)
+		join_host_limit();
+
+	load_build_rows(state);
 	if (build->count == 0)
 	{
 		state->probe_done = true;
 		return;
 	}
 
-	status = gftr_join_cuda_build(build->keys, build->count, state->device,
-		state->batch_rows, state->compact, state->device_budget, &state->build,
-		&state->timing, error);
+	remaining_host = state->host_budget - state->probe_bytes -
+		(size_t) build->capacity * input_row_bytes(build);
+	if (state->backend == JOIN_CPU)
+		status = gftr_join_cpu_build(build->keys, build->count, remaining_host,
+			&state->build, &state->timing, error);
+	else
+		status = gftr_join_cuda_build(build->keys, build->count, state->device,
+			state->batch_rows, state->compact, state->device_budget, &state->build,
+			&state->timing, error);
 
 	CHECK_FOR_INTERRUPTS();
 	if (status)
@@ -541,6 +637,199 @@ load_build(GftrJoinState *state)
 		state->matches = MemoryContextAlloc(state->context,
 			(size_t) state->batch_rows * sizeof(int32));
 	}
+}
+
+static int
+fused_group_cmp(const void *a, const void *b)
+{
+	uint64 left = *(const uint64 *) a;
+	uint64 right = *(const uint64 *) b;
+
+	return (left > right) - (left < right);
+}
+
+static int32 *
+fused_build_groups(JoinInput *build, int group_column, size_t *remaining_host,
+				   MemoryContext context, GftrFusedResult *result)
+{
+	size_t entries_bytes = (size_t) build->count * sizeof(uint64);
+	size_t indices_bytes = (size_t) build->count * sizeof(int32);
+	size_t groups_bytes;
+	const GftrValue *values = group_column >= 0 ? build->columns[group_column] : NULL;
+	uint64 *entries;
+	int32 *indices;
+	int ngroups;
+	int row;
+	int group;
+	uint64 previous;
+
+	if (entries_bytes > *remaining_host || entries_bytes > MaxAllocSize)
+		join_host_limit();
+	entries = MemoryContextAlloc(context, entries_bytes);
+	for (row = 0; row < build->count; row++)
+	{
+		uint64 key;
+
+		if (values && !values[row].valid)
+			key = GFTR_NULL_KEY;
+		else
+			key = (uint64) ((int64) (values ? values[row].value : build->keys[row]) -
+							PG_INT32_MIN);
+		/* A 33-bit signed-order key and a 31-bit nonnegative row index. */
+		entries[row] = (key << 31) | (uint32) row;
+	}
+	qsort(entries, build->count, sizeof(uint64), fused_group_cmp);
+	CHECK_FOR_INTERRUPTS();
+
+	ngroups = 1;
+	for (row = 1; row < build->count; row++)
+		if ((entries[row] >> 31) != (entries[row - 1] >> 31))
+			ngroups++;
+
+	groups_bytes = (size_t) ngroups * sizeof(GftrFusedGroup);
+	if (groups_bytes > MaxAllocSize || indices_bytes > MaxAllocSize ||
+		groups_bytes + indices_bytes > *remaining_host - entries_bytes)
+		join_host_limit();
+	result->groups = MemoryContextAllocZero(context, groups_bytes);
+	indices = MemoryContextAlloc(context, indices_bytes);
+	group = -1;
+	previous = UINT64_MAX;
+	for (row = 0; row < build->count; row++)
+	{
+		uint64 key = entries[row] >> 31;
+
+		if (key != previous)
+		{
+			GftrFusedGroup *entry = &result->groups[++group];
+
+			entry->key_null = key == GFTR_NULL_KEY;
+			if (!entry->key_null)
+				entry->key = (int32) ((int64) key + PG_INT32_MIN);
+			previous = key;
+		}
+		indices[entries[row] & PG_INT32_MAX] = group;
+	}
+	pfree(entries);
+	*remaining_host -= groups_bytes + indices_bytes;
+	result->ngroups = ngroups;
+	return indices;
+}
+
+void
+pg_gftr_fused_prepare_join(CustomScanState *join)
+{
+	GftrJoinState *state = (GftrJoinState *) join;
+
+	if (join->methods != &join_exec_methods || state->initialized)
+		elog(ERROR, "invalid pg_gftr fused join child");
+	state->backend = JOIN_CPU;
+	state->compact = false;
+}
+
+void
+pg_gftr_fused_reduce(CustomScanState *join, AttrNumber group_attno,
+					 AttrNumber sum_attno, MemoryContext context, GftrFusedResult *result)
+{
+	GftrJoinState *state = (GftrJoinState *) join;
+	JoinInput *build = &state->inputs[JOIN_BUILD];
+	JoinInput *probe = &state->inputs[JOIN_PROBE];
+	int group_column;
+	int key_idx;
+	int sum_idx = -1;
+	int max_attno;
+	size_t remaining_host;
+	int32 *indices;
+	int status;
+	int i;
+	int occupied;
+	instr_time start;
+	char error[GFTR_ERROR_SIZE] = {0};
+
+	if (join->methods != &join_exec_methods || state->backend != JOIN_CPU ||
+		join->ss.ps.state->es_epq_active ||
+		group_attno <= 0 || group_attno > state->noutputs ||
+		sum_attno < 0 || sum_attno > state->noutputs ||
+		state->outputs[group_attno - 1].side != JOIN_BUILD ||
+		(sum_attno && state->outputs[sum_attno - 1].side != JOIN_PROBE))
+		elog(ERROR, "invalid pg_gftr fused join plan");
+	if (join->ss.ps.chgParam)
+		ExecReScan(&join->ss.ps);
+	if (state->initialized)
+		elog(ERROR, "pg_gftr fused join has already been consumed");
+
+	state->probe_bytes = 0;
+	key_idx = probe->key_attno - 1;
+	group_column = state->outputs[group_attno - 1].column;
+	if (sum_attno)
+	{
+		int sum_column = state->outputs[sum_attno - 1].column;
+
+		sum_idx = sum_column < 0 ? key_idx : probe->attnos[sum_column] - 1;
+	}
+	max_attno = Max(key_idx, sum_idx) + 1;
+	*result = (GftrFusedResult) {0};
+
+	INSTR_TIME_SET_CURRENT(start);
+	load_build_rows(state);
+	if (build->count == 0)
+	{
+		result->build_ms = elapsed_ms(start);
+		state->probe_done = true;
+		return;
+	}
+
+	remaining_host = state->host_budget - (size_t) build->capacity * input_row_bytes(build);
+	indices = fused_build_groups(build, group_column, &remaining_host, context, result);
+	status = gftr_join_cpu_build_groups(build->keys, indices, build->count, remaining_host,
+									   &state->build, &state->timing, error);
+	if (status)
+		ereport(ERROR, (errmsg("pg_gftr fused join: %s", error)));
+	pfree(indices);
+	CHECK_FOR_INTERRUPTS();
+	result->build_ms = elapsed_ms(start);
+
+	INSTR_TIME_SET_CURRENT(start);
+	for (;;)
+	{
+		TupleTableSlot *slot = ExecProcNode(probe->plan);
+		int32 match;
+		GftrFusedGroup *group;
+
+		if (TupIsNull(slot))
+			break;
+		CHECK_FOR_INTERRUPTS();
+		result->probe_rows++;
+		slot_getsomeattrs(slot, max_attno);
+		if (slot->tts_isnull[key_idx])
+			continue;
+		match = gftr_join_cpu_lookup(state->build, DatumGetInt32(slot->tts_values[key_idx]));
+		if (match < 0)
+			continue;
+		Assert(match < result->ngroups);
+		group = &result->groups[match];
+		if (pg_add_s64_overflow(group->count, 1, &group->count))
+			ereport(ERROR, (errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
+							errmsg("bigint out of range")));
+		result->match_rows++;
+		if (sum_idx >= 0 && !slot->tts_isnull[sum_idx])
+		{
+			int64 value = DatumGetInt32(slot->tts_values[sum_idx]);
+
+			if (pg_add_s64_overflow(group->sum, value, &group->sum))
+				ereport(ERROR, (errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
+								errmsg("bigint out of range")));
+			group->sum_valid = true;
+		}
+	}
+	result->probe_ms = elapsed_ms(start);
+	state->probe_done = true;
+	join_cleanup(state);
+
+	occupied = 0;
+	for (i = 0; i < result->ngroups; i++)
+		if (result->groups[i].count)
+			result->groups[occupied++] = result->groups[i];
+	result->ngroups = occupied;
 }
 
 static void
@@ -578,8 +867,12 @@ load_probe_batch(GftrJoinState *state)
 	if (probe->count == 0)
 		return;
 
-	status = gftr_join_cuda_probe(state->build, probe->keys, state->probe_valid,
-		probe->count, state->matches, &state->timing, error);
+	if (state->backend == JOIN_CPU)
+		status = gftr_join_cpu_probe(state->build, probe->keys, state->probe_valid,
+			probe->count, state->matches, &state->timing, error);
+	else
+		status = gftr_join_cuda_probe(state->build, probe->keys, state->probe_valid,
+			probe->count, state->matches, &state->timing, error);
 
 	CHECK_FOR_INTERRUPTS();
 	if (status)
@@ -722,7 +1015,7 @@ join_explain(CustomScanState *node, List *ancestors, ExplainState *es)
 {
 	GftrJoinState *state = (GftrJoinState *) node;
 
-	ExplainPropertyText("Backend", "CUDA", es);
+	ExplainPropertyText("Backend", state->backend == JOIN_CPU ? "CPU reference" : "CUDA", es);
 	ExplainPropertyBool("Compaction Requested", state->compact, es);
 	ExplainPropertyInteger("Probe Batch Size", NULL, state->batch_rows, es);
 	ExplainPropertyInteger("Projected Columns", NULL, state->noutputs, es);

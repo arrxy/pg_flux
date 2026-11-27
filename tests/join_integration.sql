@@ -2,6 +2,7 @@
 
 LOAD 'pg_gftr';
 SET pg_gftr.enabled = off;
+SET pg_gftr.join_backend = :'backend';
 SET pg_gftr.join_result_mode = compact;
 SET pg_gftr.join_force = on;
 SET pg_gftr.join_batch_rows = 17;

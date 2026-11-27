@@ -132,6 +132,7 @@ query snapshot. The build lookup stays on the GPU during probe batches.
 ```sql
 LOAD 'pg_gftr';
 SET pg_gftr.join_enabled = on;
+SET pg_gftr.join_backend = 'cuda';
 SET pg_gftr.join_force = on;  -- force an eligible path for comparison
 SET pg_gftr.join_result_mode = 'auto';
 
@@ -173,6 +174,45 @@ dimension keys must be unique. The build and probe buffers obey
 the backend and are released at transaction end. Ordinary JOIN statements
 still use the regular planner. See [GPU_RESIDENT_SQL_FINDINGS.md](GPU_RESIDENT_SQL_FINDINGS.md)
 for cold and warm SQL measurements.
+
+## CPU joins and fused aggregation
+
+For an ordinary CPU lookup join, enable `pg_gftr.join_enabled` and set
+`pg_gftr.join_backend = 'cpu'`. A CUDA build defaults to `cuda` for
+eligible ordinary custom joins. A CPU-only build defaults to `cpu`.
+CUDA result compaction applies only when the ordinary join uses CUDA.
+
+
+An opt-in fused path combines a unique-build integer inner join with one
+integer group key from the build side, `COUNT(*)`, and optional
+`SUM(integer)` from the probe side. It emits group rows directly.
+
+```sql
+LOAD 'pg_gftr';
+SET pg_gftr.fused_enabled = on;
+SET pg_gftr.fused_parallel = on;
+SET max_parallel_workers_per_gather = 4;
+
+EXPLAIN (ANALYZE, BUFFERS)
+SELECT s.s_nationkey, count(*), sum(l.l_linenumber)
+FROM lineitem l JOIN supplier s ON l.l_suppkey = s.s_suppkey
+GROUP BY s.s_nationkey;
+```
+
+Look for `GftrFusedJoinAggregate`. The operator is CPU-based and uses
+`pg_gftr.join_max_host_mb` for its lookup and accumulation buffers.
+To offer the experimental parallel plan, set `pg_gftr.fused_parallel = on`
+with a positive `max_parallel_workers_per_gather`. On eligible plans, a
+parallel fact scan feeds worker-local fused aggregation, Gather receives
+partial group states and PostgreSQL finishes the aggregation. Each
+participant builds its own lookup within the configured memory budget.
+The serial fused plan is available when a parallel path cannot be built.
+
+See [FUSED_JOIN_FINDINGS.md](FUSED_JOIN_FINDINGS.md) for the workload,
+benchmarks and the effect of parallel workers.
+
+Use `bench/cpu_join_benchmark.py` for the CPU and fused comparisons. See
+[REPORT.md](REPORT.md) for the A100 study and its benchmarked revisions.
 
 ## Planner and memory controls
 
