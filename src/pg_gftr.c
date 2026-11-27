@@ -806,6 +806,7 @@ fused_begin(CustomScanState *node, EState *estate, int eflags)
 	if (!IsA(child, CustomScanState))
 		elog(ERROR, "pg_gftr fused aggregate requires a custom join child");
 	state->join = (CustomScanState *) child;
+	pg_gftr_fused_prepare_join(state->join);
 	node->custom_ps = list_make1(child);
 }
 

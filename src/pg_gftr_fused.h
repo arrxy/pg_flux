@@ -24,6 +24,8 @@ typedef struct GftrFusedResult
 	double probe_ms;
 } GftrFusedResult;
 
+void pg_gftr_fused_prepare_join(CustomScanState *join);
+
 /* Input attribute numbers are indexes into the join's scan slot. A zero
  * sum attribute requests COUNT(*) only. Results belong to context. */
 void pg_gftr_fused_reduce(CustomScanState *join, AttrNumber group_attno,
