@@ -36,6 +36,7 @@ ORDER BY l.l_orderkey, l.l_linenumber""",
 MODES = ("native", "native_tuned", "cpu", "cuda", "native_gpu_agg", "auto", "fused_cpu")
 CUSTOM_JOIN_MODES = ("cpu", "cuda", "auto", "fused_cpu")
 GROUPED_MODES = ("native_gpu_agg", "fused_cpu")
+NATIVE_MODES = ("native", "native_tuned")
 RECORD = re.compile(r"^GFTR_JOIN_RECORD (\w+)$", re.MULTILINE)
 SETTINGS = (
     "server_version",
@@ -61,7 +62,11 @@ def arguments():
     parser.add_argument("--warmups", type=int, default=1)
     parser.add_argument("--seed", type=int, default=714)
     parser.add_argument("--statement-timeout-ms", type=int, default=300_000)
-    parser.add_argument("--serial", action="store_true", help="disable plan parallelism")
+    parallelism = parser.add_mutually_exclusive_group()
+    parallelism.add_argument("--serial", action="store_true", help="disable plan parallelism")
+    parallelism.add_argument("--native-worker-sweep", nargs="+", type=int,
+                             metavar="N", help="benchmark each native mode with each limit "
+                             "for max_parallel_workers_per_gather, e.g. 0 2 4")
     parser.add_argument("--disable-jit", action="store_true")
     parser.add_argument("--tuned-work-mem-mb", type=int, default=256)
     parser.add_argument("--join-batch-rows", type=int, default=131_072)
@@ -78,6 +83,12 @@ def arguments():
         parser.error("invalid trial count, device, memory budget, batch size or timeout")
     if len(set(args.modes)) != len(args.modes) or len(set(args.cases)) != len(args.cases):
         parser.error("each mode and case may appear only once")
+    if args.native_worker_sweep is not None:
+        workers = args.native_worker_sweep
+        if min(workers) < 0 or len(set(workers)) != len(workers):
+            parser.error("--native-worker-sweep requires distinct nonnegative worker counts")
+        if not set(args.modes).intersection(NATIVE_MODES):
+            parser.error("--native-worker-sweep requires native or native_tuned mode")
     if not any(case_modes(args, case) for case in args.cases):
         parser.error("native_gpu_agg and fused_cpu are applicable to supplier_grouped only")
     return args
@@ -88,12 +99,28 @@ def case_modes(args, case):
             if mode not in GROUPED_MODES or case == "supplier_grouped"]
 
 
-def configure(args, mode):
+def mode_variants(args, case):
+    variants = {}
+    for mode in case_modes(args, case):
+        if mode in NATIVE_MODES and args.native_worker_sweep is not None:
+            for workers in args.native_worker_sweep:
+                variants[f"{mode}_w{workers}"] = (mode, workers)
+        else:
+            variants[mode] = (mode, None)
+    return variants
+
+
+def configure(args, mode, workers=None):
     settings = [
         f"SET work_mem='{args.tuned_work_mem_mb}MB';"
         if mode == "native_tuned" else "RESET work_mem;",
         f"SET pg_gftr.enabled={'on' if mode == 'native_gpu_agg' else 'off'};",
     ]
+    if args.native_worker_sweep is not None:
+        if workers is None:
+            settings.append("RESET max_parallel_workers_per_gather;")
+        else:
+            settings.append(f"SET max_parallel_workers_per_gather={workers};")
     if mode in CUSTOM_JOIN_MODES:
         backend = "cpu" if mode in ("cpu", "fused_cpu") else "cuda"
         settings += [
@@ -123,7 +150,7 @@ def record(name):
 
 
 def workload(args, database_number):
-    uses_extension = any(mode not in ("native", "native_tuned") for mode in args.modes)
+    uses_extension = any(mode not in NATIVE_MODES for mode in args.modes)
     script = [
         f"SET statement_timeout={args.statement_timeout_ms};",
         "SET search_path=pg_catalog,public;",
@@ -156,29 +183,30 @@ def workload(args, database_number):
         f"'settings', (SELECT json_object_agg(name, current_setting(name)) "
         f"FROM pg_settings WHERE name IN ({keys})));",
     ]
-    cases = {case: case_modes(args, case) for case in args.cases if case_modes(args, case)}
+    cases = {case: mode_variants(args, case) for case in args.cases if case_modes(args, case)}
     verification = {}
-    for case, modes in cases.items():
-        verify_modes = list(dict.fromkeys(["native", *modes]))
-        verification[case] = verify_modes
-        for mode in verify_modes:
-            script += configure(args, mode)
-            script += [record(f"result_{case}_{mode}"), f"{QUERIES[case]};"]
+    for case, variants in cases.items():
+        verify_variants = {"native": ("native", None), **variants}
+        verification[case] = list(verify_variants)
+        for label, (mode, workers) in verify_variants.items():
+            script += configure(args, mode, workers)
+            script += [record(f"result_{case}_{label}"), f"{QUERIES[case]};"]
 
     schedule = []
     rng = random.Random(args.seed + database_number)
     for trial in range(args.warmups + args.trials):
-        order = [(case, mode) for case, modes in cases.items() for mode in modes]
+        order = [(case, label) for case, variants in cases.items() for label in variants]
         rng.shuffle(order)
-        for case, mode in order:
-            name = f"plan_{trial}_{case}_{mode}"
-            schedule.append((trial, case, mode, name))
-            script += configure(args, mode)
+        for case, label in order:
+            mode, workers = cases[case][label]
+            name = f"plan_{trial}_{case}_{label}"
+            schedule.append((trial, case, label, name))
+            script += configure(args, mode, workers)
             script += [record(name),
                        "EXPLAIN (ANALYZE, BUFFERS, SETTINGS, TIMING OFF, FORMAT JSON)"
                        f" {QUERIES[case]};"]
     script.append("COMMIT;")
-    return "\n".join(script) + "\n", verification, schedule
+    return "\n".join(script) + "\n", cases, verification, schedule
 
 
 def walk_nodes(node):
@@ -212,18 +240,24 @@ def check_plan(plan, case, mode):
             for node in [*fused, *joins, *aggregations, *native_joins]]
 
 
+def count_workers(plan, field):
+    return sum(node.get(field, 0) for node in walk_nodes(plan["Plan"]))
+
+
 def summarize(samples):
     return {
         "execution_ms": [sample["Execution Time"] for sample in samples],
         "median_ms": statistics.median(sample["Execution Time"] for sample in samples),
         "min_ms": min(sample["Execution Time"] for sample in samples),
         "max_ms": max(sample["Execution Time"] for sample in samples),
+        "workers_planned": [count_workers(sample, "Workers Planned") for sample in samples],
+        "workers_launched": [count_workers(sample, "Workers Launched") for sample in samples],
     }
 
 
 def run_database(args, dbname, database_number, output):
     output.mkdir()
-    script, verification, schedule = workload(args, database_number)
+    script, cases, verification, schedule = workload(args, database_number)
     sql_path = output / "workload.sql"
     sql_path.write_text(script)
     stdout_path = output / "stdout.txt"
@@ -239,15 +273,17 @@ def run_database(args, dbname, database_number, output):
                for mode in modes}
         for case, modes in verification.items()
     }
-    samples = {case: {mode: [] for mode in case_modes(args, case)} for case in verification}
+    samples = {case: {label: [] for label in variants} for case, variants in cases.items()}
     plans = []
-    for trial, case, mode, name in schedule:
+    for trial, case, label, name in schedule:
+        mode, workers = cases[case][label]
         plan, = json.loads(records[name])
         operators = check_plan(plan, case, mode)
         warmup = trial < args.warmups
         if not warmup:
-            samples[case][mode].append(plan)
-        plans.append({"trial": trial + 1, "warmup": warmup, "case": case, "mode": mode,
+            samples[case][label].append(plan)
+        plans.append({"trial": trial + 1, "warmup": warmup, "case": case, "mode": label,
+                      "worker_limit": 0 if args.serial else workers,
                       "operators": operators, "explain": plan})
     for case, values in hashes.items():
         if len(set(values.values())) != 1:
