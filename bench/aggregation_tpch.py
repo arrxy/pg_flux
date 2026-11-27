@@ -35,6 +35,8 @@ def build_case(case, scale, qgen):
         raise ValueError(f'Missing qgen limit directive in {case}')
     sql = re.sub(r'^--.*$|^where rownum <= -?\d+;$', '', output, flags=re.M).strip()
     setup = ''
+    if case == 'Q1':
+        sql = sql.replace('day (3)', 'day')
     if case == 'Q15':
         view, sql, _drop, _empty = sql.split(';')
         setup = view.replace('create view', 'create temp view', 1) + ';'
