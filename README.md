@@ -11,6 +11,13 @@ Grouped Aggregations on GPUs*, Wu et al., SIGMOD 2025,
 4.1.2–4.1.3. It is an independent implementation, not the authors' code or a
 reproduction of all their experiments.
 
+
+The publication branches share the original aggregation implementation.
+`feat/gpu-opt` adds the CUDA join, compaction and resident pipeline.
+`feat/cpu-opt` adds the CPU join and serial and parallel fused aggregation.
+`main` includes both sets of changes. The A100 report records the
+revisions used for its published timings.
+
 ## Implemented scope
 
 - Ordinary SQL `GROUP BY` on one plain `integer` (`int4`) column.
