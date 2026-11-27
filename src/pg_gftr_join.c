@@ -684,6 +684,16 @@ fused_build_groups(JoinInput *build, int group_column, size_t *remaining_host,
 }
 
 void
+pg_gftr_fused_prepare_join(CustomScanState *join)
+{
+	GftrJoinState *state = (GftrJoinState *) join;
+
+	if (join->methods != &join_exec_methods || state->initialized)
+		elog(ERROR, "invalid pg_gftr fused join child");
+	state->backend = JOIN_CPU;
+}
+
+void
 pg_gftr_fused_reduce(CustomScanState *join, AttrNumber group_attno,
 					 AttrNumber sum_attno, MemoryContext context, GftrFusedResult *result)
 {
@@ -702,7 +712,7 @@ pg_gftr_fused_reduce(CustomScanState *join, AttrNumber group_attno,
 	instr_time start;
 	char error[GFTR_ERROR_SIZE] = {0};
 
-	if (join->methods != &join_exec_methods ||
+	if (join->methods != &join_exec_methods || state->backend != JOIN_CPU ||
 		join->ss.ps.state->es_epq_active ||
 		group_attno <= 0 || group_attno > state->noutputs ||
 		sum_attno < 0 || sum_attno > state->noutputs ||
@@ -714,7 +724,6 @@ pg_gftr_fused_reduce(CustomScanState *join, AttrNumber group_attno,
 	if (state->initialized)
 		elog(ERROR, "pg_gftr fused join has already been consumed");
 
-	state->backend = JOIN_CPU;
 	state->probe_bytes = 0;
 	key_idx = probe->key_attno - 1;
 	group_column = state->outputs[group_attno - 1].column;
