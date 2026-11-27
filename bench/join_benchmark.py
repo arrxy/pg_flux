@@ -242,6 +242,8 @@ def check_plan(plan, case, mode):
              if node.get("Custom Plan Provider") == "GftrFusedJoinAggregate"]
     if len(fused) != int(mode == "fused_cpu"):
         raise ValueError(f"{case}/{mode} expected a different number of GftrFusedJoinAggregate nodes")
+    if fused and fused[0].get("Backend") != "CPU":
+        raise ValueError(f"{case}/{mode} expected the CPU backend at GftrFusedJoinAggregate")
     if mode != "auto" and len(joins) != int(mode in ("cpu", "cuda", "fused_cpu")):
         raise ValueError(f"{case}/{mode} expected a different number of GftrJoin nodes")
     if len(aggregations) != int(mode == "native_gpu_agg"):
