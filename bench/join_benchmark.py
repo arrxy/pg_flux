@@ -61,6 +61,10 @@ def arguments():
     parser.add_argument("--seed", type=int, default=714)
     parser.add_argument("--statement-timeout-ms", type=int, default=300_000)
     parser.add_argument("--serial", action="store_true", help="disable plan parallelism")
+    parser.add_argument("--tuned-workers", type=int,
+                        help="parallel workers per Gather for native_tuned (other modes are serial)")
+    parser.add_argument("--match-work-mem", action="store_true",
+                        help="apply tuned work_mem across modes")
     parser.add_argument("--disable-jit", action="store_true")
     parser.add_argument("--tuned-work-mem-mb", type=int, default=256)
     parser.add_argument("--join-batch-rows", type=int, default=131_072)
@@ -75,6 +79,10 @@ def arguments():
                    args.join_max_device_mb, args.agg_max_input_mb,
                    args.statement_timeout_ms) < 1):
         parser.error("invalid trial count, device, memory budget, batch size or timeout")
+    if args.serial and args.tuned_workers is not None:
+        parser.error("--serial and --tuned-workers cannot be combined")
+    if args.tuned_workers is not None and args.tuned_workers < 0:
+        parser.error("tuned workers must be nonnegative")
     if len(set(args.modes)) != len(args.modes) or len(set(args.cases)) != len(args.cases):
         parser.error("each mode and case may appear only once")
     if not any(case_modes(args, case) for case in args.cases):
@@ -90,9 +98,12 @@ def case_modes(args, case):
 def configure(args, mode):
     settings = [
         f"SET work_mem='{args.tuned_work_mem_mb}MB';"
-        if mode == "native_tuned" else "RESET work_mem;",
+        if mode == "native_tuned" or args.match_work_mem else "RESET work_mem;",
         f"SET pg_gftr.enabled={'on' if mode == 'native_gpu_agg' else 'off'};",
     ]
+    if args.tuned_workers is not None:
+        workers = args.tuned_workers if mode == "native_tuned" else 0
+        settings.append(f"SET max_parallel_workers_per_gather={workers};")
     if mode in CUSTOM_JOIN_MODES:
         result_mode = mode.removeprefix("cuda_") if mode.startswith("cuda_") else "auto"
         settings += [
