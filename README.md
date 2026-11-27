@@ -156,6 +156,28 @@ PostgreSQL, native with increased `work_mem`, the compact CPU lookup and CUDA.
 It checks result digests and plan providers and saves complete JSON plans.
 See [JOIN_FINDINGS.md](JOIN_FINDINGS.md) for measured performance.
 
+## CPU fused join and aggregation
+
+An opt-in fused path combines a unique-build integer inner join with one
+integer group key from the build side, `COUNT(*)`, and optional
+`SUM(integer)` from the probe side. It emits group rows directly.
+
+```sql
+LOAD 'pg_gftr';
+SET pg_gftr.fused_enabled = on;
+SET pg_gftr.fused_force = on;  -- choose the eligible experimental path
+
+EXPLAIN (ANALYZE, BUFFERS)
+SELECT s.s_nationkey, count(*), sum(l.l_linenumber)
+FROM lineitem l JOIN supplier s ON l.l_suppkey = s.s_suppkey
+GROUP BY s.s_nationkey;
+```
+
+Look for `GftrFusedJoinAggregate`. The operator is CPU-based and uses
+`pg_gftr.join_max_host_mb` for its lookup and accumulation buffers.
+See [FUSED_JOIN_FINDINGS.md](FUSED_JOIN_FINDINGS.md) for the workload,
+benchmarks and the effect of parallel workers.
+
 ## Planner and memory controls
 
 | Setting | Default | Meaning |
