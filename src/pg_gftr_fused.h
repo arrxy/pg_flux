@@ -2,6 +2,7 @@
 #define PG_GFTR_FUSED_H
 
 #include "nodes/execnodes.h"
+#include "nodes/pathnodes.h"
 
 typedef struct GftrFusedGroup
 {
@@ -27,5 +28,8 @@ typedef struct GftrFusedResult
 void pg_gftr_fused_reduce(CustomScanState *join, AttrNumber group_attno,
 						  AttrNumber sum_attno, MemoryContext context,
 						  GftrFusedResult *result);
+
+/* Build a private, serial GftrJoin child from a native join's proof. */
+Path *pg_gftr_fused_join_path(PlannerInfo *root, Path *native_path);
 
 #endif

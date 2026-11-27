@@ -311,7 +311,8 @@ fused_join_child(Path *path, Var *group, Var *sum)
 }
 
 static void
-add_fused_path(RelOptInfo *input_rel, RelOptInfo *output_rel, List *scan_tlist)
+add_fused_path(PlannerInfo *root, RelOptInfo *input_rel,
+			   RelOptInfo *output_rel, List *scan_tlist)
 {
 	Var *group = (Var *) linitial_node(TargetEntry, scan_tlist)->expr;
 	Var *sum = NULL;
@@ -343,6 +344,23 @@ add_fused_path(RelOptInfo *input_rel, RelOptInfo *output_rel, List *scan_tlist)
 
 		if (candidate && (!best || compare_path_costs(candidate, best, TOTAL_COST) < 0))
 			best = candidate;
+	}
+	/*
+	 * Fusion is independent of the plain join GUCs. If there is no
+	 * suitable custom candidate, use a private child derived from a
+	 * native path without adding that child to the join relation.
+	 */
+	if (!best)
+	{
+		foreach(lc, input_rel->pathlist)
+		{
+			Path *candidate = pg_gftr_fused_join_path(root, lfirst(lc));
+
+			if (candidate)
+				candidate = fused_join_child(candidate, group, sum);
+			if (candidate && (!best || compare_path_costs(candidate, best, TOTAL_COST) < 0))
+				best = candidate;
+		}
 	}
 	if (!best || (!fused_force && best->rows < gftr_min_rows))
 		return;
@@ -413,7 +431,7 @@ gftr_upper_paths(PlannerInfo *root, UpperRelationKind stage,
 	if (!has_aggregate)
 		return;
 	if (fused_enabled)
-		add_fused_path(input_rel, output_rel, scan_tlist);
+		add_fused_path(root, input_rel, output_rel, scan_tlist);
 	if (!gftr_enabled)
 		return;
 
