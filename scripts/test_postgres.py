@@ -56,6 +56,10 @@ def main():
                     subprocess.run([*cmd, '-f', str(root / 'tests' / 'fused_integration.sql')],
                                    stdout=log, stderr=subprocess.STDOUT, check=True)
                 print('PostgreSQL fused join integration tests passed')
+                with (work / 'fused_parallel.log').open('w') as log:
+                    subprocess.run([*cmd, '-f', str(root / 'tests' / 'fused_parallel_integration.sql')],
+                                   stdout=log, stderr=subprocess.STDOUT, check=True)
+                print('PostgreSQL parallel fused join integration tests passed')
         if args.benchmark_smoke:
             connection = f'host={work} user={getpass.getuser()} dbname=gftr_test_gftr'
             subprocess.run(['python3', str(root / 'bench' / 'benchmark.py'),
