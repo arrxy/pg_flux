@@ -143,7 +143,7 @@ int main()
             }
 
             check_join(gftr_join_cuda_build(build_keys.data(), scenario.build_rows, 0, batch_rows,
-                                           budget, &build, &timing, error), error);
+                                           0, budget, &build, &timing, error), error);
             std::unique_ptr<GftrJoinBuild, decltype(&gftr_join_cuda_free)>
                 owner(build, gftr_join_cuda_free);
             for (bool random_order : {false, true})
