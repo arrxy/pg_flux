@@ -175,6 +175,13 @@ GROUP BY s.s_nationkey;
 
 Look for `GftrFusedJoinAggregate`. The operator is CPU-based and uses
 `pg_gftr.join_max_host_mb` for its lookup and accumulation buffers.
+To offer the experimental parallel plan, set `pg_gftr.fused_parallel = on`
+with a positive `max_parallel_workers_per_gather`. On eligible plans, a
+parallel fact scan feeds worker-local fused aggregation, Gather receives
+partial group states and PostgreSQL finishes the aggregation. Each
+participant builds its own lookup within the configured memory budget.
+The serial fused plan is available when a parallel path cannot be built.
+
 See [FUSED_JOIN_FINDINGS.md](FUSED_JOIN_FINDINGS.md) for the workload,
 benchmarks and the effect of parallel workers.
 

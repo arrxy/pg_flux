@@ -52,3 +52,19 @@ All result digests matched. The serial path also passed exact SQL multiset
 and type comparisons on fixtures covering NULL groups and join keys, all-NULL
 sums, signed extremes, missing keys, duplicates on the probe side, empty
 builds, rescan and unsupported query shapes.
+
+## Worker-local fusion
+
+The separate `pg_gftr.fused_parallel` opt-in uses PostgreSQL's parallel-aware
+sequential fact scan. Each participating backend builds a private dimension
+lookup and updates local int8 aggregate transition states. Gather reads those
+small states, and PostgreSQL's native final hash aggregate combines them.
+There is no Gather of streamed fact tuples. EXPLAIN identifies the partial
+custom scan and labels its counters as local to a participant. Budget for
+one build per participant when setting the operator's host memory limit.
+
+The parallel candidate requires an eligible parallel-safe base plan, a
+hashable group key and a top-level query. The serial path handles cases such
+as correlated rescans. GPU fusion remains an operator-level research
+prototype. Existing measurements show that uploading host-resident input
+dominates its kernel time. See [JOIN_FINDINGS.md](JOIN_FINDINGS.md).
