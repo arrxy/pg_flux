@@ -2,7 +2,7 @@
 
 **Aritro Roy and Kiran Ghumare** · Final project report · November 2026
 
-GPU grouped aggregation beat serial PostgreSQL on the focal workloads measured so far. SF5 A1 was 3.25× faster in GFTR, with GFUR already providing 3.16×. PostgreSQL's parallel plans beat CUDA on SF1 A2 and A3 and on SF5 A2. For ordinary order joins, tuned PostgreSQL won both the selective and broad comparisons. GFTR improved the wide SF5 GPU join benchmark by 1.20× versus partitioned GFUR, and reusing a loaded GPU snapshot paid off on the second SF5 execution of the fixed two-join workload.
+GPU grouped aggregation beat serial PostgreSQL in all ten focal comparisons. SF5 A1 was 3.25× faster in GFTR, with GFUR already providing 3.16×. PostgreSQL's parallel plans beat CUDA on A2 and A3 at both scales. For ordinary order joins, tuned PostgreSQL won both the selective and broad comparisons. GFTR improved the wide SF5 GPU join benchmark by 1.20× versus partitioned GFUR, and reusing a loaded GPU snapshot paid off on the second SF5 execution of the fixed two-join workload.
 
 This checkpoint covers completed trials. Additional SQL cases and the SF1 crossover repetition are in progress.
 
@@ -37,9 +37,12 @@ The A100 runs used JIT off and 256 MB work_mem. GPU selection was forced for sup
 | SF1 | Q13 | 1.230 [1.212–1.254] | 1.263 [1.202–1.304] | 0.823 [0.803–0.890] | 0.834 [0.824–0.884] | 1.48× | 1.52× | 0 |
 | SF5 | A1 | 18.016 [16.361–18.749] | 18.512 [17.278–20.425] | 5.700 [5.588–5.856] | 5.538 [5.466–5.563] | 3.25× | 3.34× | 0 |
 | SF5 | A2 | 9.028 [8.208–9.069] | 1.901 [1.798–1.950] | 5.581 [5.063–5.804] | 5.547 [5.160–5.900] | 1.63× | 0.34× | 4 |
+| SF5 | A3 | 12.017 [11.977–12.470] | 2.389 [2.352–2.437] | 8.138 [8.001–9.095] | 8.322 [8.189–9.054] | 1.44× | 0.29× | 4 |
+| SF5 | A4 | 4.567 [3.818–4.754] | 4.465 [3.781–4.987] | 1.420 [1.362–1.466] | 1.416 [1.311–1.488] | 3.22× | 3.15× | 0 |
+| SF5 | Q13 | 10.132 [10.068–10.517] | 10.378 [9.900–12.056] | 6.354 [6.225–7.829] | 7.422 [6.613–7.893] | 1.37× | 1.40× | 0 |
 <!-- END AGG SQL -->
 
-Brackets show the measured range. Each focal case has its own sampled plans and result signatures in `aggregation-sql/sf*/timed/`.
+Brackets show the measured range. Each focal case has its own sampled plans and result signatures in `aggregation-sql/sf*/timed/`. GFTR beat serial native in ten of ten cases. A2 and A3 were the only cases that launched native workers, and those plans beat both GPU modes. The four-worker setting left A1, A4 and Q13 serial at both scales. The sampled native focal plans reported zero temporary blocks written.
 
 ### October RTX A6000 reference
 
@@ -97,6 +100,9 @@ The join study used 256 MB work_mem, JIT off, a 131,072-row GPU probe batch, one
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | SF1 | orders_broad | 2.140 [2.088–2.244] | 0.618 [0.613–0.621] | 1.364 [1.345–1.400] | 1.358 [1.347–1.392] | 1.363 [1.332–1.379] | — |
 | SF1 | orders_selective | 1.410 [1.354–1.468] | 0.141 [0.135–0.147] | 1.387 [1.314–1.410] | 1.317 [1.283–1.326] | 1.330 [1.285–1.364] | — |
+| SF1 | part_payload | 2.252 [2.176–2.309] | 0.533 [0.516–0.545] | 1.960 [1.853–1.989] | 1.988 [1.856–2.041] | 1.945 [1.926–2.001] | — |
+| SF1 | supplier_grouped | 2.265 [2.103–2.381] | 0.467 [0.448–0.478] | 2.192 [2.144–2.307] | 2.268 [2.063–2.363] | 2.221 [2.047–2.246] | 1.700 [1.622–1.796] |
+| SF1 | supplier_projected | 0.038 [0.034–0.042] | 0.038 [0.033–0.042] | 0.027 [0.027–0.029] | 0.029 [0.028–0.031] | 0.027 [0.027–0.029] | — |
 | SF5 | orders_broad | 11.910 [11.174–12.233] | 3.149 [3.117–3.158] | 6.805 [6.697–6.981] | 6.883 [6.787–7.244] | 6.768 [6.625–7.006] | — |
 | SF5 | orders_selective | 7.723 [6.138–7.768] | 1.502 [1.437–1.533] | 7.041 [6.896–7.249] | 6.981 [6.551–8.046] | 7.539 [6.630–7.849] | — |
 <!-- END JOIN SQL -->
@@ -105,6 +111,7 @@ Brackets show the measured range. All five SQL shapes preserve their output desc
 
 - **Selective order join.** The SF5 match rate was 1.30%. Auto compacted 229 of 229 batches and reduced device-to-host match metadata from 119,999,184 to 3,109,680 bytes (97.4%). The device-to-host phase fell from 44.37 to 10.65 ms. Dense, compact and auto SQL ranges overlap. Tuned PostgreSQL used a four-worker hash join at SF5 and a three-worker nested loop with index access at SF1.
 - **Broad order join.** Auto used dense output in all batches. At SF5, forcing compaction still used the dense fallback on all 229 batches. Median probe time increased from 3.63 to 10.73 ms and match output grew by 916 bytes of control metadata. Auto beat serial native by 1.76× but took 2.15× as long as tuned native.
+- **Bounded supplier projection at SF1.** CUDA dense took 27.30 ms versus 38.17 ms for tuned native (1.40×), with disjoint measured ranges. Both used the lineitem primary-key range scan. The CUDA plan built a lookup from 10,000 suppliers and matched all 40,278 probe rows. The native plan used a nested loop with memoized supplier index lookups and launched zero workers.
 - **Host work.** The custom scan packs input tuples, sends batches, then constructs PostgreSQL output slots on the host. The device-to-host byte counts cover match metadata. The SF5 selective auto plan recorded separate build and probe scan/pack medians of 1.27 s and 5.49 s. Raw plans and per-mode transfer counters are in `join-sql/`.
 
 ## Transformed join payloads and device residency
@@ -144,7 +151,7 @@ The extension provides an explicit load and a fixed SQL function that returns th
 
 A cold GPU snapshot lost to tuned native in both scales. The median-based model predicts a crossover at two executions. SF5 confirmed it in the paired series. At one execution the resident path took 6.851 s versus 4.914 s tuned native. At two it took 6.939 s versus 9.889 s. The initial SF1 pair at two executions took 1.732 s resident versus 1.660 s tuned native, so small timing shifts can reverse the result near the modeled crossover.
 
-<!-- SF1 CROSSOVER -->
+The follow-up at SF1 favored the resident path in three more paired two-execution trials, by 8–101 ms. Across the four pairs, two executions were sensitive to run variation. At three executions, the resident path won all three follow-up pairs. It took 1.648–1.698 s versus 2.605–2.656 s tuned native. Both datasets also passed a direct equality check in the same repeatable-read transaction.
 
 All these sums use server execution time and include the resident loader. The scope is one explicit snapshot and one fixed query. PostgreSQL's ordinary planner uses the separate SQL join path above. Raw evidence is in `join-residency/*-summary.json` and its accompanying SQL and session logs.
 
