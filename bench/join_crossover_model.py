@@ -123,6 +123,7 @@ def predict(calibration, native):
             "gpu_phase_ms": phases,
             "predicted_gpu_ms": gpu_ms,
             "tuned_native_ms": native_ms,
+            "tuned_native_checksum": native["checksums_sha256"][case]["native_tuned"],
             "predicted_gpu_wins": gpu_ms < native_ms,
         }
     return {"calibration_medians": training, "predictions": predictions}
@@ -132,6 +133,9 @@ def score(frozen, validation):
     actual = gpu_observations(validation)
     rows = {}
     for case, prediction in frozen["predictions"].items():
+        cuda_checksum = validation["checksums_sha256"][case]["cuda_auto"]
+        if cuda_checksum != prediction["tuned_native_checksum"]:
+            raise ValueError(f"held-out result checksum differs for {case}")
         observed = actual[case]
         measured_ms = observed["wall_ms"]
         wins = measured_ms < prediction["tuned_native_ms"]
