@@ -165,7 +165,8 @@ integer group key from the build side, `COUNT(*)`, and optional
 ```sql
 LOAD 'pg_gftr';
 SET pg_gftr.fused_enabled = on;
-SET pg_gftr.fused_force = on;  -- choose the eligible experimental path
+SET pg_gftr.fused_parallel = on;
+SET max_parallel_workers_per_gather = 4;
 
 EXPLAIN (ANALYZE, BUFFERS)
 SELECT s.s_nationkey, count(*), sum(l.l_linenumber)

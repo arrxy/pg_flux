@@ -59,8 +59,8 @@ The separate `pg_gftr.fused_parallel` opt-in uses PostgreSQL's parallel-aware
 sequential fact scan. Each participating backend builds a private dimension
 lookup and updates local int8 aggregate transition states. Gather reads those
 small states, and PostgreSQL's native final hash aggregate combines them.
-There is no Gather of streamed fact tuples. EXPLAIN identifies the partial
-custom scan and labels its counters as local to a participant. Budget for
+EXPLAIN identifies the partial custom scan and labels its counters as local
+to a participant. Budget for
 one build per participant when setting the operator's host memory limit.
 
 The parallel candidate requires an eligible parallel-safe base plan, a
@@ -68,3 +68,33 @@ hashable group key and a top-level query. The serial path handles cases such
 as correlated rescans. GPU fusion remains an operator-level research
 prototype. Existing measurements show that uploading host-resident input
 dominates its kernel time. See [JOIN_FINDINGS.md](JOIN_FINDINGS.md).
+
+| Plan | Workers launched | SF1 | SF5 |
+| --- | ---: | ---: | ---: |
+| Native join and aggregation | 2 | 785 ms | 4,181 ms |
+| Native fact preaggregation | 2 | 596 ms | 3,164 ms |
+| Parallel fused CPU | 2 | 356 ms | 1,954 ms |
+| Native join and aggregation | 4 | 478 ms | 2,489 ms |
+| Native fact preaggregation | 4 | 380 ms | 1,990 ms |
+| Parallel fused CPU | 4 | 214 ms | 1,078 ms |
+
+All result digests matched. With four workers, parallel fusion was
+2.23× as fast as the original native query at SF1 and 2.31× as fast at
+SF5. It was 1.78× and 1.85× as fast as native fact preaggregation.
+Gather handled 75 partial group rows with two workers and 125 with four,
+including the leader, before reducing them to 25 final groups. Both scales
+launched every requested worker in every timed trial.
+
+The planner also selected the four-worker fused path with
+`fused_enabled` and `fused_parallel` on and `fused_force` off in the two
+TPC-H databases. Fusion stays opt-in. The measurements cover one join and
+grouping shape in isolated sessions. The SQL tests verify exact results
+with workers, with leader participation disabled, and after falling back
+to serial fusion when the worker limit is zero.
+
+```bash
+python3 bench/join_benchmark.py --dbname tpch_sf1 tpch_sf5 \
+  --cases supplier_grouped --modes native native_preagg fused_parallel \
+  --native-worker-sweep 2 4 --fused-worker-sweep 2 4 \
+  --trials 3 --warmups 1 --output results/fused-parallel
+```
