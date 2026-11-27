@@ -6,6 +6,7 @@
 #include "catalog/pg_type_d.h"
 #include "commands/explain.h"
 #include "commands/explain_format.h"
+#include "common/int.h"
 #include "executor/executor.h"
 #include "miscadmin.h"
 #include "nodes/extensible.h"
@@ -20,6 +21,7 @@
 #include "utils/memutils.h"
 
 #include "gftr_join.h"
+#include "pg_gftr_fused.h"
 
 #define MIB ((size_t) 1024 * 1024)
 #define JOIN_MIN_BUILD_CAPACITY 4096
@@ -481,20 +483,11 @@ elapsed_ms(instr_time start)
 }
 
 static void
-load_build(GftrJoinState *state)
+load_build_rows(GftrJoinState *state)
 {
 	JoinInput *build = &state->inputs[JOIN_BUILD];
-	JoinInput *probe = &state->inputs[JOIN_PROBE];
 	TupleTableSlot *slot;
 	instr_time start;
-	size_t remaining_host;
-	int status;
-	char error[GFTR_ERROR_SIZE] = {0};
-
-	state->probe_bytes = (size_t) state->batch_rows *
-		(input_row_bytes(probe) + sizeof(uint8) + sizeof(int32));
-	if (state->probe_bytes >= state->host_budget)
-		join_host_limit();
 
 	INSTR_TIME_SET_CURRENT(start);
 	for (;;)
@@ -516,6 +509,23 @@ load_build(GftrJoinState *state)
 	}
 	state->build_pack_ms = elapsed_ms(start);
 	state->initialized = true;
+}
+
+static void
+load_build(GftrJoinState *state)
+{
+	JoinInput *build = &state->inputs[JOIN_BUILD];
+	JoinInput *probe = &state->inputs[JOIN_PROBE];
+	size_t remaining_host;
+	int status;
+	char error[GFTR_ERROR_SIZE] = {0};
+
+	state->probe_bytes = (size_t) state->batch_rows *
+		(input_row_bytes(probe) + sizeof(uint8) + sizeof(int32));
+	if (state->probe_bytes >= state->host_budget)
+		join_host_limit();
+
+	load_build_rows(state);
 	if (build->count == 0)
 	{
 		state->probe_done = true;
@@ -543,6 +553,187 @@ load_build(GftrJoinState *state)
 		state->matches = MemoryContextAlloc(state->context,
 			(size_t) state->batch_rows * sizeof(int32));
 	}
+}
+
+static int
+fused_group_cmp(const void *a, const void *b)
+{
+	uint64 left = *(const uint64 *) a;
+	uint64 right = *(const uint64 *) b;
+
+	return (left > right) - (left < right);
+}
+
+static int32 *
+fused_build_groups(JoinInput *build, int group_column, size_t *remaining_host,
+				   MemoryContext context, GftrFusedResult *result)
+{
+	size_t entries_bytes = (size_t) build->count * sizeof(uint64);
+	size_t indices_bytes = (size_t) build->count * sizeof(int32);
+	size_t groups_bytes;
+	const GftrValue *values = group_column >= 0 ? build->columns[group_column] : NULL;
+	uint64 *entries;
+	int32 *indices;
+	int ngroups;
+	int row;
+	int group;
+	uint64 previous;
+
+	if (entries_bytes > *remaining_host || entries_bytes > MaxAllocSize)
+		join_host_limit();
+	entries = MemoryContextAlloc(context, entries_bytes);
+	for (row = 0; row < build->count; row++)
+	{
+		uint64 key;
+
+		if (values && !values[row].valid)
+			key = GFTR_NULL_KEY;
+		else
+			key = (uint64) ((int64) (values ? values[row].value : build->keys[row]) -
+							PG_INT32_MIN);
+		/* A 33-bit signed-order key and a 31-bit nonnegative row index. */
+		entries[row] = (key << 31) | (uint32) row;
+	}
+	qsort(entries, build->count, sizeof(uint64), fused_group_cmp);
+	CHECK_FOR_INTERRUPTS();
+
+	ngroups = 1;
+	for (row = 1; row < build->count; row++)
+		if ((entries[row] >> 31) != (entries[row - 1] >> 31))
+			ngroups++;
+
+	groups_bytes = (size_t) ngroups * sizeof(GftrFusedGroup);
+	if (groups_bytes > MaxAllocSize || indices_bytes > MaxAllocSize ||
+		groups_bytes + indices_bytes > *remaining_host - entries_bytes)
+		join_host_limit();
+	result->groups = MemoryContextAllocZero(context, groups_bytes);
+	indices = MemoryContextAlloc(context, indices_bytes);
+	group = -1;
+	previous = UINT64_MAX;
+	for (row = 0; row < build->count; row++)
+	{
+		uint64 key = entries[row] >> 31;
+
+		if (key != previous)
+		{
+			GftrFusedGroup *entry = &result->groups[++group];
+
+			entry->key_null = key == GFTR_NULL_KEY;
+			if (!entry->key_null)
+				entry->key = (int32) ((int64) key + PG_INT32_MIN);
+			previous = key;
+		}
+		indices[entries[row] & PG_INT32_MAX] = group;
+	}
+	pfree(entries);
+	*remaining_host -= groups_bytes + indices_bytes;
+	result->ngroups = ngroups;
+	return indices;
+}
+
+void
+pg_gftr_fused_reduce(CustomScanState *join, AttrNumber group_attno,
+					 AttrNumber sum_attno, MemoryContext context, GftrFusedResult *result)
+{
+	GftrJoinState *state = (GftrJoinState *) join;
+	JoinInput *build = &state->inputs[JOIN_BUILD];
+	JoinInput *probe = &state->inputs[JOIN_PROBE];
+	int group_column;
+	int key_idx = probe->key_attno - 1;
+	int sum_idx = -1;
+	int max_attno;
+	size_t remaining_host;
+	int32 *indices;
+	int status;
+	int i;
+	int occupied;
+	instr_time start;
+	char error[GFTR_ERROR_SIZE] = {0};
+
+	if (join->methods != &join_exec_methods ||
+		join->ss.ps.state->es_epq_active ||
+		group_attno <= 0 || group_attno > state->noutputs ||
+		sum_attno < 0 || sum_attno > state->noutputs ||
+		state->outputs[group_attno - 1].side != JOIN_BUILD ||
+		(sum_attno && state->outputs[sum_attno - 1].side != JOIN_PROBE))
+		elog(ERROR, "invalid pg_gftr fused join plan");
+	if (join->ss.ps.chgParam)
+		ExecReScan(&join->ss.ps);
+	if (state->initialized)
+		elog(ERROR, "pg_gftr fused join has already been consumed");
+
+	state->backend = JOIN_CPU;
+	group_column = state->outputs[group_attno - 1].column;
+	if (sum_attno)
+	{
+		int sum_column = state->outputs[sum_attno - 1].column;
+
+		sum_idx = sum_column < 0 ? key_idx : probe->attnos[sum_column] - 1;
+	}
+	max_attno = Max(key_idx, sum_idx) + 1;
+	*result = (GftrFusedResult) {0};
+
+	INSTR_TIME_SET_CURRENT(start);
+	load_build_rows(state);
+	if (build->count == 0)
+	{
+		result->build_ms = elapsed_ms(start);
+		state->probe_done = true;
+		return;
+	}
+
+	remaining_host = state->host_budget - (size_t) build->capacity * input_row_bytes(build);
+	indices = fused_build_groups(build, group_column, &remaining_host, context, result);
+	status = gftr_join_cpu_build_groups(build->keys, indices, build->count, remaining_host,
+									   &state->build, &state->timing, error);
+	if (status)
+		ereport(ERROR, (errmsg("pg_gftr fused join: %s", error)));
+	pfree(indices);
+	CHECK_FOR_INTERRUPTS();
+	result->build_ms = elapsed_ms(start);
+
+	INSTR_TIME_SET_CURRENT(start);
+	for (;;)
+	{
+		TupleTableSlot *slot = ExecProcNode(probe->plan);
+		int32 match;
+		GftrFusedGroup *group;
+
+		if (TupIsNull(slot))
+			break;
+		CHECK_FOR_INTERRUPTS();
+		result->probe_rows++;
+		slot_getsomeattrs(slot, max_attno);
+		if (slot->tts_isnull[key_idx])
+			continue;
+		match = gftr_join_cpu_lookup(state->build, DatumGetInt32(slot->tts_values[key_idx]));
+		if (match < 0)
+			continue;
+		Assert(match < result->ngroups);
+		group = &result->groups[match];
+		if (pg_add_s64_overflow(group->count, 1, &group->count))
+			ereport(ERROR, (errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
+							errmsg("bigint out of range")));
+		result->match_rows++;
+		if (sum_idx >= 0 && !slot->tts_isnull[sum_idx])
+		{
+			int64 value = DatumGetInt32(slot->tts_values[sum_idx]);
+
+			if (pg_add_s64_overflow(group->sum, value, &group->sum))
+				ereport(ERROR, (errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
+								errmsg("bigint out of range")));
+			group->sum_valid = true;
+		}
+	}
+	result->probe_ms = elapsed_ms(start);
+	state->probe_done = true;
+	join_cleanup(state);
+
+	occupied = 0;
+	for (i = 0; i < result->ngroups; i++)
+		if (result->groups[i].count)
+			result->groups[occupied++] = result->groups[i];
+	result->ngroups = occupied;
 }
 
 static void
