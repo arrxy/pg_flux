@@ -4,7 +4,7 @@
 
 GPU grouped aggregation beat serial PostgreSQL in all ten focal comparisons. SF5 A1 was 3.25× faster in GFTR, with GFUR already providing 3.16×. PostgreSQL's parallel plans beat CUDA on A2 and A3 at both scales. For ordinary order joins, tuned PostgreSQL won both the selective and broad comparisons. GFTR improved the wide SF5 GPU join benchmark by 1.20× versus partitioned GFUR, and reusing a loaded GPU snapshot paid off on the second SF5 execution of the fixed two-join workload.
 
-This checkpoint covers completed trials. Additional SQL cases and the SF1 crossover repetition are in progress.
+The crossover model selected tuned PostgreSQL in all eight held-out joins and estimated CUDA latency with 11.42% mean absolute relative error. PG-Strom selected GPU plans but failed during execution on this host. Its planning evidence and the exact-verified controls are included.
 
 ## Research question and implementation
 
@@ -186,6 +186,27 @@ The frozen model predicted the native winner and the CUDA output mode in all eig
 
 For the fixed resident API, the prediction compares the one-time load and first call plus one warm cost per subsequent call against repeated tuned native execution. The predicted threshold was two calls at both scales. The measured SF5 pair crossed at two. At SF1 two calls went both ways and three calls won all follow-up pairs. These are reuse tests of one query shape. The model and outputs are in `offload-crossover/`, including the supplementary SQL plans and the measured snapshot series.
 
+## PG-Strom comparison on the same A100
+
+We built PG-Strom 6.1.0 at `4d12ef415759d` against a separate copy of the same PostgreSQL 18.6 installation and loaded the same SF1 tables and primary-key indexes into a disposable cluster. The comparison harness runs identical SQL in tuned native PostgreSQL, `pg_flux` and PG-Strom. It retains the four-worker native baseline, validates result multisets and output descriptions, and saves JSON plans. The PG-Strom service loaded an A100 fatbin for compute capability 8.0. [PG-Strom installation documentation](https://heterodb.github.io/pg-strom/install/)
+
+Default PG-Strom planning selected GPU nodes for all nine screened workloads, without adjusting its planner costs. A1, A2 and A4 selected `GpuPreAgg`. A3, the grouped supplier join, the two order joins and the part payload join fused join work into `GpuPreAgg`. The bounded supplier projection selected `GpuJoin`. The operators can therefore cover different portions of the same SQL query.
+
+**The PG-Strom speed comparison is unavailable on this runtime.** When executing A1, the unmodified release repeatedly logged `recv(2): Bad address` in its GPU service and failed to return the result. The GPU-service probe did not reproduce the receive error in isolation. A diagnostic build staged socket receives in host memory and removed that error, but its A1 query timed out. With the service ready, the diagnostic build's bounded `GpuJoin` reported a `cuMemAdvise` policy failure and an out-of-memory message. The A100 runtime reported `concurrentManagedAccess=0`. The data establish an execution failure on this host. Its underlying cause remains undetermined.
+
+The preserved PG-Strom plans are planning-only. An early smoke query completed on CPU fallback while the service was starting. It supplies no PG-Strom GPU latency. The verified ordinary native and `pg_flux` executions and plans are in the preceding SQL sections.
+
+We ran four exact-verified controls in the same disposable cluster with PG-Strom disabled. Medians from three measured rounds after one warmup are in ms. The last column shows the release's planning-only GPU operator.
+
+| SF1 query | Tuned native | pg_flux | PG-Strom planned operator |
+| --- | ---: | ---: | --- |
+| A1 | 2,336.20 | 1,137.77 | GpuPreAgg |
+| A2 | 337.47 | 1,065.10 | GpuPreAgg |
+| Broad order join | 662.81 | 1,700.75 | GpuPreAgg with join |
+| Bounded supplier projection | 39.70 | 26.49 | GpuJoin |
+
+The archive's `pg-strom/screen/` contains the selected plans and SQL. Actual controls and ranges are under `pg-strom/controls/`. The build, service and failure logs are in the same directory tree. The repository includes the disposable installation and comparison scripts. [Build recipe](scripts/prepare_pg_strom_comparison.sh) · [Comparison harness](bench/pg_strom_comparison.py)
+
 ## Interpretation and follow-up
 
 GFTR changes memory access after ordering. Aggregation still pays for sorting each transformed payload and for PostgreSQL tuple conversion. For join outputs, widening the payload makes the extra transformation worthwhile in the observed SF5 device-resident case. Retaining inputs and intermediates on the GPU avoids much larger copies in a narrow chain. The first SQL execution includes scanning, packing, upload and lookup construction.
@@ -223,3 +244,4 @@ The raw-results archive contains an index and SHA-256 manifest. Its directory na
 | `join-sql/` | Matched-settings SQL plans, exact checks, batch statistics and transfer bytes |
 | `join-residency/` | Resident CUDA trials, same-snapshot checks, SQL plans and crossover trials |
 | `offload-crossover/` | Calibration and held-out JSON plans, frozen predictions, model errors and snapshot reuse |
+| `pg-strom/` | Matched SQL, planning JSON, release and diagnostic run evidence |
