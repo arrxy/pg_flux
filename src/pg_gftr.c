@@ -24,6 +24,7 @@
 #include "portability/instr_time.h"
 
 #include "gftr_backend.h"
+#include "gftr_join.h"
 
 #if PG_VERSION_NUM < 180000 || PG_VERSION_NUM >= 190000
 #error "pg_gftr currently supports PostgreSQL 18 only"
@@ -162,9 +163,9 @@ Datum
 pg_gftr_version(PG_FUNCTION_ARGS)
 {
 #ifdef GFTR_WITH_CUDA
-	PG_RETURN_TEXT_P(cstring_to_text("pg_gftr 0.1.0 (CUDA + CPU reference)"));
+	PG_RETURN_TEXT_P(cstring_to_text("pg_gftr 0.1.1 (CUDA + CPU reference)"));
 #else
-	PG_RETURN_TEXT_P(cstring_to_text("pg_gftr 0.1.0 (CPU reference; CUDA not built)"));
+	PG_RETURN_TEXT_P(cstring_to_text("pg_gftr 0.1.1 (CPU reference; CUDA not built)"));
 #endif
 }
 
@@ -191,6 +192,7 @@ _PG_init(void)
 		NULL, &gftr_setup_cost, 1000.0, 0.0, 1e12, PGC_USERSET, 0, NULL, NULL, NULL);
 	DefineCustomRealVariable("pg_gftr.tuple_cost", "Estimated packing, transfer and compute cost per row.",
 		NULL, &gftr_tuple_cost, 0.02, 0.0, 1e6, PGC_USERSET, 0, NULL, NULL, NULL);
+	gftr_join_init();
 	MarkGUCPrefixReserved("pg_gftr");
 	RegisterCustomScanMethods(&scan_methods);
 	previous_upper_hook = create_upper_paths_hook;
@@ -200,6 +202,7 @@ _PG_init(void)
 void
 _PG_fini(void)
 {
+	gftr_join_fini();
 	if (create_upper_paths_hook == gftr_upper_paths)
 		create_upper_paths_hook = previous_upper_hook;
 }

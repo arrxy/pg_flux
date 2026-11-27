@@ -46,7 +46,16 @@ def main():
                 script = f"SET pg_gftr.mode = '{mode}';\n" + sql
                 subprocess.run(cmd, input=script, text=True, stdout=log,
                                stderr=subprocess.STDOUT, check=True)
-            print(f'{args.backend}/{mode}: PostgreSQL integration tests passed')
+            print(f'{args.backend}/{mode}: PostgreSQL aggregation integration tests passed')
+            if mode == 'gftr' and args.backend == 'cuda':
+                with (work / 'join.log').open('w') as log:
+                    subprocess.run([*cmd, '-f', str(root / 'tests' / 'join_integration.sql')],
+                                   stdout=log, stderr=subprocess.STDOUT, check=True)
+                print(f'{args.backend}: PostgreSQL join integration tests passed')
+                with (work / 'resident.log').open('w') as log:
+                    subprocess.run([*cmd, '-f', str(root / 'tests' / 'resident_integration.sql')],
+                                   stdout=log, stderr=subprocess.STDOUT, check=True)
+                print('CUDA resident SQL integration tests passed')
         if args.benchmark_smoke:
             connection = f'host={work} user={getpass.getuser()} dbname=gftr_test_gftr'
             subprocess.run(['python3', str(root / 'bench' / 'benchmark.py'),
