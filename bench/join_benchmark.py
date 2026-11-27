@@ -33,8 +33,9 @@ FROM lineitem l JOIN supplier s ON l.l_suppkey = s.s_suppkey
 WHERE l.l_orderkey BETWEEN 1 AND 40000
 ORDER BY l.l_orderkey, l.l_linenumber""",
 }
-MODES = ("native", "native_tuned", "cpu", "cuda", "native_gpu_agg", "auto")
-CUSTOM_JOIN_MODES = ("cpu", "cuda", "auto")
+MODES = ("native", "native_tuned", "cpu", "cuda", "native_gpu_agg", "auto", "fused_cpu")
+CUSTOM_JOIN_MODES = ("cpu", "cuda", "auto", "fused_cpu")
+GROUPED_MODES = ("native_gpu_agg", "fused_cpu")
 RECORD = re.compile(r"^GFTR_JOIN_RECORD (\w+)$", re.MULTILINE)
 SETTINGS = (
     "server_version",
@@ -78,13 +79,13 @@ def arguments():
     if len(set(args.modes)) != len(args.modes) or len(set(args.cases)) != len(args.cases):
         parser.error("each mode and case may appear only once")
     if not any(case_modes(args, case) for case in args.cases):
-        parser.error("native_gpu_agg is applicable to supplier_grouped only")
+        parser.error("native_gpu_agg and fused_cpu are applicable to supplier_grouped only")
     return args
 
 
 def case_modes(args, case):
     return [mode for mode in args.modes
-            if mode != "native_gpu_agg" or case == "supplier_grouped"]
+            if mode not in GROUPED_MODES or case == "supplier_grouped"]
 
 
 def configure(args, mode):
@@ -94,7 +95,7 @@ def configure(args, mode):
         f"SET pg_gftr.enabled={'on' if mode == 'native_gpu_agg' else 'off'};",
     ]
     if mode in CUSTOM_JOIN_MODES:
-        backend = "cpu" if mode == "cpu" else "cuda"
+        backend = "cpu" if mode in ("cpu", "fused_cpu") else "cuda"
         settings += [
             "SET pg_gftr.join_enabled=on;",
             f"SET pg_gftr.join_force={'off' if mode == 'auto' else 'on'};",
@@ -105,6 +106,14 @@ def configure(args, mode):
         settings.append(
             "SELECT 'SET pg_gftr.join_enabled=off;' "
             "WHERE current_setting('pg_gftr.join_enabled', true) IS NOT NULL \\gexec"
+        )
+    if mode == "fused_cpu":
+        settings += ["SET pg_gftr.fused_enabled=on;", "SET pg_gftr.fused_force=on;"]
+    else:
+        # Older builds have no fused GUC. Native and existing modes still work.
+        settings.append(
+            "SELECT 'SET pg_gftr.fused_enabled=off;' "
+            "WHERE current_setting('pg_gftr.fused_enabled', true) IS NOT NULL \\gexec"
         )
     return settings
 
@@ -183,7 +192,11 @@ def check_plan(plan, case, mode):
     joins = [node for node in nodes if node.get("Custom Plan Provider") == "GftrJoin"]
     aggregations = [node for node in nodes
                     if node.get("Custom Plan Provider") == "GftrAggregate"]
-    if mode != "auto" and len(joins) != int(mode in ("cpu", "cuda")):
+    fused = [node for node in nodes
+             if node.get("Custom Plan Provider") == "GftrFusedJoinAggregate"]
+    if len(fused) != int(mode == "fused_cpu"):
+        raise ValueError(f"{case}/{mode} expected a different number of GftrFusedJoinAggregate nodes")
+    if mode != "auto" and len(joins) != int(mode in ("cpu", "cuda", "fused_cpu")):
         raise ValueError(f"{case}/{mode} expected a different number of GftrJoin nodes")
     if len(aggregations) != int(mode == "native_gpu_agg"):
         raise ValueError(f"{case}/{mode} expected a different number of GftrAggregate nodes")
@@ -192,11 +205,11 @@ def check_plan(plan, case, mode):
         raise ValueError(f"{case}/{mode} has no join node")
     for node in joins:
         backend = str(node.get("Backend", "")).lower()
-        expected = "cpu" if mode == "cpu" else "cuda"
+        expected = "cpu" if mode in ("cpu", "fused_cpu") else "cuda"
         if expected not in backend:
             raise ValueError(f"{case}/{mode} expected the {expected} backend, got {backend!r}")
     return [{key: value for key, value in node.items() if key != "Plans"}
-            for node in [*joins, *aggregations, *native_joins]]
+            for node in [*fused, *joins, *aggregations, *native_joins]]
 
 
 def summarize(samples):
