@@ -10,7 +10,7 @@ NVCC ?= $(CUDA_HOME)/bin/nvcc
 CUDA_ARCH ?= 80
 NVCCFLAGS ?= -O3 -std=c++17
 
-OBJS = src/pg_gftr.o src/pg_gftr_join.o src/gftr_cpu.o src/gftr_join_cpu.o
+OBJS = src/pg_gftr.o src/pg_gftr_join.o src/pg_gftr_parallel.o src/gftr_cpu.o src/gftr_join_cpu.o
 PG_CPPFLAGS = -Isrc
 ifeq ($(USE_CUDA),1)
 OBJS += src/gftr_cuda.o src/gftr_join_cuda.o
@@ -32,7 +32,7 @@ src/gftr_join_cuda.o: src/gftr_join_cuda.cu src/gftr_join.h src/gftr_backend.h s
 	$(NVCC) $(NVCCFLAGS) -Xcompiler=-fPIC -gencode arch=compute_$(CUDA_ARCH),code=sm_$(CUDA_ARCH) -gencode arch=compute_$(CUDA_ARCH),code=compute_$(CUDA_ARCH) -Isrc -c $< -o $@
 
 src/pg_gftr.o src/pg_gftr_join.o src/gftr_join_cpu.o src/gftr_join_cuda_stub.o: src/gftr_join.h
-src/pg_gftr.o src/pg_gftr_join.o: src/pg_gftr_fused.h
+src/pg_gftr.o src/pg_gftr_join.o src/pg_gftr_parallel.o: src/pg_gftr_fused.h
 src/gftr_join_cpu.o: src/gftr_join_lookup.h
 src/pg_gftr.o src/pg_gftr_join.o src/gftr_cpu.o src/gftr_cuda_stub.o src/gftr_join_cpu.o src/gftr_join_cuda_stub.o: src/gftr_backend.h
 

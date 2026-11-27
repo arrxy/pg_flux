@@ -128,6 +128,7 @@ typedef struct GftrFusedAggregateState
 
 static bool fused_enabled = false;
 static bool fused_force = false;
+static bool fused_parallel = false;
 static bool gftr_enabled = false;
 static bool gftr_force = false;
 static int gftr_backend = 0;
@@ -216,6 +217,8 @@ _PG_init(void)
 		NULL, &fused_enabled, false, PGC_USERSET, 0, NULL, NULL, NULL);
 	DefineCustomBoolVariable("pg_gftr.fused_force", "Prefer supported fused paths for experiments.",
 		NULL, &fused_force, false, PGC_USERSET, 0, NULL, NULL, NULL);
+	DefineCustomBoolVariable("pg_gftr.fused_parallel", "Offer worker-local fused aggregation.",
+		NULL, &fused_parallel, false, PGC_USERSET, 0, NULL, NULL, NULL);
 	DefineCustomBoolVariable("pg_gftr.enabled", "Offer GPU aggregate paths.",
 		NULL, &gftr_enabled, false, PGC_USERSET, 0, NULL, NULL, NULL);
 	DefineCustomBoolVariable("pg_gftr.force", "Prefer supported custom paths for experiments.",
@@ -254,10 +257,10 @@ _PG_fini(void)
 
 /* Match built-in aggregate OIDs, never names that a search_path can shadow. */
 static int
-aggregate_op(Aggref *agg)
+aggregate_op(Aggref *agg, AggSplit split)
 {
 	TargetEntry *arg;
-	if (agg->agglevelsup != 0 || agg->aggsplit != AGGSPLIT_SIMPLE ||
+	if (agg->agglevelsup != 0 || agg->aggsplit != split ||
 		agg->aggkind != AGGKIND_NORMAL || agg->aggdistinct || agg->aggorder ||
 		agg->aggfilter || agg->aggdirectargs || agg->aggvariadic)
 		return 0;
@@ -311,8 +314,8 @@ fused_join_child(Path *path, Var *group, Var *sum)
 }
 
 static void
-add_fused_path(PlannerInfo *root, RelOptInfo *input_rel,
-			   RelOptInfo *output_rel, List *scan_tlist)
+add_fused_path(PlannerInfo *root, RelOptInfo *input_rel, RelOptInfo *output_rel,
+			   GroupPathExtraData *extra, List *scan_tlist)
 {
 	Var *group = (Var *) linitial_node(TargetEntry, scan_tlist)->expr;
 	Var *sum = NULL;
@@ -326,7 +329,7 @@ add_fused_path(PlannerInfo *root, RelOptInfo *input_rel,
 	for_each_from(lc, scan_tlist, 1)
 	{
 		Aggref *agg = (Aggref *) lfirst_node(TargetEntry, lc)->expr;
-		int op = aggregate_op(agg);
+		int op = aggregate_op(agg, AGGSPLIT_SIMPLE);
 
 		if (op == GFTR_COUNT_STAR)
 			count = true;
@@ -363,6 +366,11 @@ add_fused_path(PlannerInfo *root, RelOptInfo *input_rel,
 		}
 	}
 	if (!best || (!fused_force && best->rows < gftr_min_rows))
+		return;
+	if (fused_parallel &&
+		pg_gftr_add_parallel_fused_path(root, output_rel, extra, best, scan_tlist,
+										&fused_path_methods, fused_force) &&
+		fused_force)
 		return;
 
 	path = makeNode(CustomPath);
@@ -421,7 +429,7 @@ gftr_upper_paths(PlannerInfo *root, UpperRelationKind stage,
 		Node *expr = lfirst(lc);
 		if (equal(expr, key))
 			continue;
-		if (!IsA(expr, Aggref) || !aggregate_op((Aggref *) expr))
+		if (!IsA(expr, Aggref) || !aggregate_op((Aggref *) expr, AGGSPLIT_SIMPLE))
 			return;
 		if (!tlist_member((Expr *) expr, scan_tlist))
 			scan_tlist = lappend(scan_tlist,
@@ -431,7 +439,7 @@ gftr_upper_paths(PlannerInfo *root, UpperRelationKind stage,
 	if (!has_aggregate)
 		return;
 	if (fused_enabled)
-		add_fused_path(root, input_rel, output_rel, scan_tlist);
+		add_fused_path(root, input_rel, output_rel, group_extra, scan_tlist);
 	if (!gftr_enabled)
 		return;
 
@@ -484,6 +492,8 @@ gftr_plan_path(PlannerInfo *root, RelOptInfo *rel, CustomPath *path,
 	Plan *child = (Plan *) linitial(children);
 	List *scan_tlist = path->custom_private;
 	bool fused = path->methods == &fused_path_methods;
+	AggSplit split = fused && path->path.parallel_workers > 0 ?
+		AGGSPLIT_INITIAL_SERIAL : AGGSPLIT_SIMPLE;
 	List *source_tlist = child->targetlist;
 	TargetEntry *key_entry;
 	List *attrs = NIL;
@@ -503,8 +513,10 @@ gftr_plan_path(PlannerInfo *root, RelOptInfo *rel, CustomPath *path,
 	for_each_from(lc, scan_tlist, 1)
 	{
 		Aggref *agg = (Aggref *) lfirst_node(TargetEntry, lc)->expr;
-		int op = aggregate_op(agg);
+		int op = aggregate_op(agg, split);
 		int col = -1;
+		if (!op)
+			elog(ERROR, "pg_gftr: unsupported aggregate in custom plan");
 		if (op != GFTR_COUNT_STAR)
 		{
 			TargetEntry *arg = linitial_node(TargetEntry, agg->args);
@@ -872,8 +884,11 @@ fused_explain(CustomScanState *node, List *ancestors, ExplainState *es)
 
 	ExplainPropertyText("Backend", "CPU", es);
 	ExplainPropertyText("Algorithm", "Fused unique join and grouped reduction", es);
+	ExplainPropertyBool("Partial", node->ss.ps.plan->parallel_safe, es);
 	if (es->analyze && state->loaded)
 	{
+		if (node->ss.ps.plan->parallel_safe)
+			ExplainPropertyText("Counter Scope", "Local participant", es);
 		ExplainPropertyUInteger("Probe Rows", NULL, state->result.probe_rows, es);
 		ExplainPropertyUInteger("Matched Rows", NULL, state->result.match_rows, es);
 		ExplainPropertyInteger("Groups", NULL, state->result.ngroups, es);
