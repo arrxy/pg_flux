@@ -163,9 +163,9 @@ Datum
 pg_gftr_version(PG_FUNCTION_ARGS)
 {
 #ifdef GFTR_WITH_CUDA
-	PG_RETURN_TEXT_P(cstring_to_text("pg_gftr 0.1.0 (CUDA + CPU reference)"));
+	PG_RETURN_TEXT_P(cstring_to_text("pg_gftr 0.1.1 (CUDA + CPU reference)"));
 #else
-	PG_RETURN_TEXT_P(cstring_to_text("pg_gftr 0.1.0 (CPU reference; CUDA not built)"));
+	PG_RETURN_TEXT_P(cstring_to_text("pg_gftr 0.1.1 (CPU reference; CUDA not built)"));
 #endif
 }
 

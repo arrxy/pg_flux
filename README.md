@@ -151,6 +151,29 @@ PostgreSQL reconstructs the index vector in probe order. EXPLAIN reports
 whether compaction was requested, actual dense and compact batch counts,
 and the number of bytes transferred.
 
+## Resident two-join SQL experiment
+
+Install the CUDA build and update an existing installation with
+`ALTER EXTENSION pg_gftr UPDATE TO '0.1.1'`. The explicit snapshot API
+implements the TPC-H `lineitem → orders → customer` join and returns
+`[count(*), sum(o_custkey), sum(c_nationkey)]` as a bigint array.
+
+```sql
+BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY;
+SELECT pg_gftr_resident_load('lineitem', 'orders', 'customer');
+SELECT pg_gftr_resident_run();
+SELECT pg_gftr_resident_run();  -- reuse the projected columns and GPU lookups
+COMMIT;
+```
+
+The loader reads the named ordinary tables under the caller's privileges and
+snapshot. Dimension columns must be non-NULL, nonnegative integers, and
+dimension keys must be unique. The build and probe buffers obey
+`pg_gftr.max_input_mb` and `pg_gftr.max_device_mb`. GPU buffers are private to
+the backend and are released at transaction end. Ordinary JOIN statements
+still use the regular planner. See [GPU_RESIDENT_SQL_FINDINGS.md](GPU_RESIDENT_SQL_FINDINGS.md)
+for cold and warm SQL measurements.
+
 ## Planner and memory controls
 
 | Setting | Default | Meaning |

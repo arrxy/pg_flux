@@ -52,6 +52,10 @@ def main():
                     subprocess.run([*cmd, '-f', str(root / 'tests' / 'join_integration.sql')],
                                    stdout=log, stderr=subprocess.STDOUT, check=True)
                 print(f'{args.backend}: PostgreSQL join integration tests passed')
+                with (work / 'resident.log').open('w') as log:
+                    subprocess.run([*cmd, '-f', str(root / 'tests' / 'resident_integration.sql')],
+                                   stdout=log, stderr=subprocess.STDOUT, check=True)
+                print('CUDA resident SQL integration tests passed')
         if args.benchmark_smoke:
             connection = f'host={work} user={getpass.getuser()} dbname=gftr_test_gftr'
             subprocess.run(['python3', str(root / 'bench' / 'benchmark.py'),
