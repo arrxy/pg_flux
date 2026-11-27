@@ -4,6 +4,7 @@ import argparse
 from hashlib import sha256
 import json
 import math
+import re
 from pathlib import Path
 import statistics
 
@@ -33,6 +34,7 @@ def gpu_observations(report):
             "build_rows": join["Build Rows"],
             "matched_rows": join["Output Rows"],
             "batch_rows": join["Probe Batch Size"],
+            "projected_columns": join["Projected Columns"],
             "h2d_bytes": join["H2D Bytes"],
             "d2h_bytes": join["D2H Bytes"],
             "compaction_requested": join["Compaction Requested"],
@@ -158,6 +160,53 @@ def score(frozen, validation):
     }
 
 
+def snapshot_reuse(directory):
+    output = {}
+    for path in sorted(directory.glob("sf*-summary.json")):
+        reference = json.loads(path.read_text())
+        resident = reference["resident"]
+        tuned_ms = reference["native"]["tuned"]["median_ms"]
+        cold_ms = resident["cold_ms"]
+        warm_ms = resident["warm_ms"]
+        crossing = (max(1, math.floor((cold_ms - warm_ms) / (tuned_ms - warm_ms)) + 1)
+                    if tuned_ms > warm_ms else (1 if cold_ms < tuned_ms else None))
+        scale = path.name.removesuffix("-summary.json")
+        sessions = {
+            int(count): [(sum(series["resident_ms"]), sum(series["native_ms"]))]
+            for count, series in reference["validated_series"].items()
+        }
+        for resident_log in sorted(directory.glob(f"{scale}-resident-series-*-repeat*.log")):
+            tail = resident_log.name.removeprefix(f"{scale}-resident-series-")
+            count = int(tail.split("-")[0])
+            native_log = directory / f"{scale}-native-series-{tail}"
+            pattern = r"Execution Time: ([0-9.]+) ms"
+            resident_times = re.findall(pattern, resident_log.read_text())
+            native_times = re.findall(pattern, native_log.read_text())
+            if len(resident_times) != count + 1 or len(native_times) != count:
+                raise ValueError(f"unexpected number of EXPLAIN timings in {tail}")
+            sessions.setdefault(count, []).append((sum(map(float, resident_times)),
+                                                   sum(map(float, native_times))))
+        output[scale] = {
+            "source_summary_sha256": sha256(path.read_bytes()).hexdigest(),
+            "cold_ms": cold_ms,
+            "warm_ms": warm_ms,
+            "tuned_native_ms": tuned_ms,
+            "predicted_crossover": crossing,
+            "validation": {
+                count: {
+                    "predicted_resident_ms": cold_ms + (count - 1) * warm_ms,
+                    "predicted_native_ms": count * tuned_ms,
+                    "resident_total_ms": [resident_ms for resident_ms, _ in comparisons],
+                    "native_total_ms": [native_ms for _, native_ms in comparisons],
+                    "resident_wins": [resident_ms < native_ms
+                                      for resident_ms, native_ms in comparisons],
+                }
+                for count, comparisons in sorted(sessions.items())
+            },
+        }
+    return output
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="action", required=True)
@@ -169,6 +218,9 @@ def main():
     validate.add_argument("prediction", type=Path)
     validate.add_argument("gpu_validation", type=Path)
     validate.add_argument("output", type=Path)
+    snapshot = commands.add_parser("snapshot")
+    snapshot.add_argument("resident_sql_results", type=Path)
+    snapshot.add_argument("output", type=Path)
     args = parser.parse_args()
 
     if args.action == "predict":
@@ -176,12 +228,14 @@ def main():
         native, baseline_sha = load_report(args.tuned_native)
         result = predict(calibration, native)
         result.update(calibration_sha256=calibration_sha, tuned_native_sha256=baseline_sha)
-    else:
+    elif args.action == "score":
         encoded = args.prediction.read_bytes()
         validation, validation_sha = load_report(args.gpu_validation)
         result = score(json.loads(encoded), validation)
         result.update(prediction_sha256=sha256(encoded).hexdigest(),
                       gpu_validation_sha256=validation_sha)
+    else:
+        result = snapshot_reuse(args.resident_sql_results)
     with args.output.open("x") as output:
         json.dump(result, output, indent=2)
         output.write("\n")
