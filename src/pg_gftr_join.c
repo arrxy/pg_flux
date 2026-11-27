@@ -20,6 +20,7 @@
 #include "utils/memutils.h"
 
 #include "gftr_join.h"
+#include "pg_gftr_fused.h"
 
 #define MIB ((size_t) 1024 * 1024)
 #define JOIN_MIN_BUILD_CAPACITY 4096
@@ -186,9 +187,11 @@ supported_base(PlannerInfo *root, RelOptInfo *rel)
 		!contain_volatile_functions((Node *) rel->baserestrictinfo);
 }
 
-static void
-join_paths(PlannerInfo *root, RelOptInfo *joinrel, RelOptInfo *outerrel,
-		   RelOptInfo *innerrel, JoinType jointype, JoinPathExtraData *extra)
+static Path *
+make_supported_join_path(PlannerInfo *root, RelOptInfo *joinrel,
+						 RelOptInfo *outerrel, RelOptInfo *innerrel,
+						 JoinType jointype, bool inner_unique,
+						 List *restrictlist, bool fused)
 {
 	Path *probe;
 	Path *build;
@@ -200,31 +203,28 @@ join_paths(PlannerInfo *root, RelOptInfo *joinrel, RelOptInfo *outerrel,
 	ListCell *lc;
 	CustomPath *path;
 
-	if (previous_join_hook)
-		previous_join_hook(root, joinrel, outerrel, innerrel, jointype, extra);
-
-	if (!join_enabled || jointype != JOIN_INNER || !extra->inner_unique ||
-		list_length(extra->restrictlist) != 1 ||
+	if (jointype != JOIN_INNER || !inner_unique ||
+		list_length(restrictlist) != 1 ||
 		!supported_base(root, outerrel) || !supported_base(root, innerrel) ||
 		!bms_is_empty(joinrel->lateral_relids))
-		return;
+		return NULL;
 
 	/* EvalPlanQual and its single-tuple rechecks require native paths. */
 	for (query = root; query != NULL; query = query->parent_root)
 	{
 		if (query->parse->commandType != CMD_SELECT || query->parse->rowMarks ||
 			query->parse->hasModifyingCTE)
-			return;
+			return NULL;
 	}
 
-	rinfo = linitial_node(RestrictInfo, extra->restrictlist);
+	rinfo = linitial_node(RestrictInfo, restrictlist);
 	if (rinfo->pseudoconstant || !IsA(rinfo->clause, OpExpr))
-		return;
+		return NULL;
 
 	op = (OpExpr *) rinfo->clause;
 	if (op->opno != Int4EqualOperator || list_length(op->args) != 2 ||
 		!plain_int4_var(linitial(op->args)) || !plain_int4_var(lsecond(op->args)))
-		return;
+		return NULL;
 
 	probe_key = linitial_node(Var, op->args);
 	build_key = lsecond_node(Var, op->args);
@@ -236,15 +236,15 @@ join_paths(PlannerInfo *root, RelOptInfo *joinrel, RelOptInfo *outerrel,
 		build_key = swap;
 	}
 	if (probe_key->varno != outerrel->relid || build_key->varno != innerrel->relid)
-		return;
+		return NULL;
 
 	probe = outerrel->cheapest_total_path;
 	build = innerrel->cheapest_total_path;
 	if (!probe || !build || probe->param_info || build->param_info ||
 		!list_member(probe->pathtarget->exprs, probe_key) ||
 		!list_member(build->pathtarget->exprs, build_key) ||
-		(!join_force && probe->rows < join_min_rows))
-		return;
+		(!fused && !join_force && probe->rows < join_min_rows))
+		return NULL;
 
 	foreach(lc, joinrel->reltarget->exprs)
 	{
@@ -253,7 +253,7 @@ join_paths(PlannerInfo *root, RelOptInfo *joinrel, RelOptInfo *outerrel,
 		if (!plain_int4_var(expr) ||
 			(!list_member(probe->pathtarget->exprs, expr) &&
 			 !list_member(build->pathtarget->exprs, expr)))
-			return;
+			return NULL;
 	}
 
 	path = makeNode(CustomPath);
@@ -264,21 +264,74 @@ join_paths(PlannerInfo *root, RelOptInfo *joinrel, RelOptInfo *outerrel,
 	path->path.disabled_nodes = build->disabled_nodes + probe->disabled_nodes;
 	/* Provisional constants cover setup and packing until benchmark data is available. */
 	path->path.startup_cost = build->total_cost + probe->startup_cost +
-		(join_backend == JOIN_CUDA ? 1000.0 : 0.0) + build->rows * 2 * cpu_tuple_cost;
+		(!fused && join_backend == JOIN_CUDA ? 1000.0 : 0.0) + build->rows * 2 * cpu_tuple_cost;
 	path->path.total_cost = path->path.startup_cost +
 		probe->total_cost - probe->startup_cost +
 		2 * probe->rows * cpu_tuple_cost + joinrel->rows * cpu_tuple_cost;
-	if (join_force)
+	if (!fused && join_force)
 	{
 		path->path.disabled_nodes = 0;
 		path->path.startup_cost = 0;
 		path->path.total_cost = 0.001;
 	}
 	path->custom_paths = list_make2(probe, build);
-	path->custom_restrictinfo = extra->restrictlist;
+	path->custom_restrictinfo = restrictlist;
 	path->custom_private = list_make2(probe_key, build_key);
 	path->methods = &join_path_methods;
-	add_path(joinrel, &path->path);
+	return &path->path;
+}
+
+
+static void
+join_paths(PlannerInfo *root, RelOptInfo *joinrel, RelOptInfo *outerrel,
+		   RelOptInfo *innerrel, JoinType jointype, JoinPathExtraData *extra)
+{
+	Path *path;
+
+	if (previous_join_hook)
+		previous_join_hook(root, joinrel, outerrel, innerrel, jointype, extra);
+	if (!join_enabled)
+		return;
+
+	path = make_supported_join_path(root, joinrel, outerrel, innerrel,
+		jointype, extra->inner_unique, extra->restrictlist, false);
+	if (path)
+		add_path(joinrel, path);
+}
+
+Path *
+pg_gftr_fused_join_path(PlannerInfo *root, Path *native_path)
+{
+	JoinPath *join;
+
+	/* A Gather can supply a uniqueness proof, but its worker paths cannot
+	 * be executed as serial children. Build fresh children from the base
+	 * relations after rechecking the same join restrictions. */
+	for (;;)
+	{
+		if (IsA(native_path, ProjectionPath))
+			native_path = ((ProjectionPath *) native_path)->subpath;
+		else if (IsA(native_path, GatherPath))
+			native_path = ((GatherPath *) native_path)->subpath;
+		else if (IsA(native_path, GatherMergePath))
+			native_path = ((GatherMergePath *) native_path)->subpath;
+		else
+			break;
+	}
+	if (!IsA(native_path, HashPath) && !IsA(native_path, MergePath) &&
+		!IsA(native_path, NestPath))
+		return NULL;
+
+	join = (JoinPath *) native_path;
+	/* Nested loops can push join restrictions into a parameterized child.
+	 * Reject any such child before switching to unparameterized paths. */
+	if (native_path->param_info || join->outerjoinpath->param_info ||
+		join->innerjoinpath->param_info)
+		return NULL;
+
+	return make_supported_join_path(root, native_path->parent,
+		join->outerjoinpath->parent, join->innerjoinpath->parent,
+		join->jointype, join->inner_unique, join->joinrestrictinfo, true);
 }
 
 static Plan *
