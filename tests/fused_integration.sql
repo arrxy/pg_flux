@@ -88,7 +88,7 @@ SELECT pg_temp.assert_fused(
 SELECT pg_temp.assert_fused(
     'SELECT d.grp, count(*) AS c1, count(*) AS c2, sum(f.value) FROM fused_fact f JOIN fused_dim d USING (id) GROUP BY d.grp ORDER BY c1 DESC, d.grp LIMIT 2', true);
 SELECT pg_temp.assert_fused(
-    'SELECT x, (SELECT count(*) FROM (SELECT d.grp, count(*) AS hits FROM fused_fact f JOIN fused_dim d USING (id) WHERE f.value < x GROUP BY d.grp LIMIT 2) g) AS groups FROM generate_series(10,50,10) x', true);
+    'SELECT x, (SELECT sum(hits) FROM (SELECT d.grp, count(*) AS hits FROM fused_fact f JOIN fused_dim d USING (id) WHERE f.value < x GROUP BY d.grp ORDER BY d.grp LIMIT 2) g) AS groups FROM generate_series(10,50,10) x', true);
 
 SET plan_cache_mode = force_generic_plan;
 PREPARE fused_query(int) AS
