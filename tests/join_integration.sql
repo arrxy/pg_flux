@@ -58,7 +58,7 @@ SELECT pg_temp.assert_join(
 SELECT pg_temp.assert_join(
     'SELECT p.other, b.payload AS dimension, b.k, p.payload AS fact FROM join_build b JOIN join_probe p ON b.k = p.k WHERE p.payload > 27', true);
 SELECT pg_temp.assert_join(
-    'SELECT count(*), sum(b.payload), sum(p.other) FROM join_probe p JOIN join_build b USING (k)', true);
+    'SELECT count(*), sum(b.payload) AS dimension, sum(p.other) AS fact FROM join_probe p JOIN join_build b USING (k)', true);
 SELECT pg_temp.assert_join(
     'SELECT b.payload AS dimension, p.payload AS fact FROM join_probe p JOIN join_empty b USING (k)', true);
 SELECT pg_temp.assert_join(
