@@ -18,7 +18,7 @@ We tested whether GPU execution accelerates joins and grouped aggregations in Po
 
 - NVIDIA A100-SXM4-80GB, AMD EPYC host, NVIDIA driver 610.43.02, CUDA 12.6 (nvcc 12.6.85), PostgreSQL 18.6, extension 0.1.1, sm_80. The tested extension implementation is the one on `gpu-resident-sql` at `34085f6`. The report branch also contains benchmark drivers.
 - The A100 datasets were generated and loaded on the host. SF1 and SF5 contain 6,001,215 and 29,999,795 lineitem rows. Both have the eight TPC-H tables and their primary-key indexes. Earlier RTX A6000 values come from the October 24 progress report. Differences between hosts, builds and workload reconstruction limit a direct hardware comparison.
-- Full SQL timings use PostgreSQL server execution time. This includes execution-time scans, packing, transfers and result consumption inside the plan. Planning and normal client result delivery are outside that boundary. Cache dropping was disabled. CUDA timings identify whether data were already resident and whether they include allocation, upload and transformation. Ratios use baseline divided by candidate.
+- Full SQL timings use PostgreSQL server execution time. This includes execution-time scans, packing, transfers and result consumption inside the plan. Planning and normal client result delivery are outside that boundary. The OS and PostgreSQL caches were left warm between runs. The SF1 Q2 and SF5 part-join runs may overlap host-only compiler activity during PG-Strom setup. CUDA timings identify whether data were already resident and whether they include allocation, upload and transformation. Ratios use baseline divided by candidate.
 - The A100 verified the standalone CPU cases, 72 aggregation fixtures in each CUDA mode (144 GPU runs), CUDA join backend, and PostgreSQL integration for GFTR, GFUR, CUDA joins and the resident SQL API. The benchmark harness smoke test matched its checksums. These are controlled TPC-H workload measurements. The paper used an A100 40 GB and CUDA 12.2.
 
 ## Grouped aggregation in PostgreSQL
@@ -27,7 +27,6 @@ A1 groups lineitem by part, A2 by supplier, A3 by supplier nation after a native
 
 The A100 runs used JIT off and 256 MB work_mem. GPU selection was forced for supported operators and GPU joins were disabled. We compared exact sorted result records and PostgreSQL output descriptions before timing. Every custom case used one timed warmup and five measured rounds per mode. Standard queries used three measured rounds after one warmup. Mode order was interleaved by a fixed seed. In the four-worker configuration, the planner selected the actual number of workers.
 
-<!-- AGG SQL -->
 | Scale | Case | Serial native (s) | Four-worker limit (s) | GFUR (s) | GFTR (s) | Serial / GFTR | Four-worker limit / GFTR | Workers launched |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | SF1 | A1 | 2.454 [2.170–2.568] | 2.440 [1.925–2.625] | 1.035 [0.897–1.117] | 1.083 [0.888–1.151] | 2.27× | 2.25× | 0 |
@@ -40,7 +39,6 @@ The A100 runs used JIT off and 256 MB work_mem. GPU selection was forced for sup
 | SF5 | A3 | 12.017 [11.977–12.470] | 2.389 [2.352–2.437] | 8.138 [8.001–9.095] | 8.322 [8.189–9.054] | 1.44× | 0.29× | 4 |
 | SF5 | A4 | 4.567 [3.818–4.754] | 4.465 [3.781–4.987] | 1.420 [1.362–1.466] | 1.416 [1.311–1.488] | 3.22× | 3.15× | 0 |
 | SF5 | Q13 | 10.132 [10.068–10.517] | 10.378 [9.900–12.056] | 6.354 [6.225–7.829] | 7.422 [6.613–7.893] | 1.37× | 1.40× | 0 |
-<!-- END AGG SQL -->
 
 Brackets show the measured range. Each focal case has its own sampled plans and result signatures in `aggregation-sql/sf*/timed/`. GFTR beat serial native in ten of ten cases. A2 and A3 were the only cases that launched native workers, and those plans beat both GPU modes. The four-worker setting left A1, A4 and Q13 serial at both scales. The sampled native focal plans reported zero temporary blocks written.
 
@@ -48,7 +46,7 @@ Brackets show the measured range. Each focal case has its own sampled plans and 
 
 All 22 standard shapes were screened at each scale. Q13 was the only plan showing the CUDA aggregate, and its executed CUDA plans passed the exact check. The SF1 timings cover 20 standard queries. Q17 and Q20 hit the five-minute statement limit during native result validation. Their plans contain correlated sequential scans of lineitem with the loaded primary-key indexes. The failed SQL and error logs are included.
 
-The October report does not identify its ten timed SF5 standard queries. We selected Q1, Q3, Q4, Q5, Q6, Q9, Q12, Q13, Q14 and Q19 for this study. <!-- STANDARD SF5 RESULTS --> Timing differences in plans that stayed native are evidence about variation on the host and do not measure accelerator throughput.
+The October report does not identify its ten timed SF5 standard queries. We selected Q1, Q3, Q4, Q5, Q6, Q9, Q12, Q13, Q14 and Q19 for this study. All ten selected SF5 queries completed with matching results and output types. Timing differences in plans that stayed native are evidence about variation on the host and do not measure accelerator throughput.
 
 ### October RTX A6000 reference
 
@@ -101,7 +99,6 @@ GFTR reduced the reduction-kernel median in all four cells. The strongest net ga
 
 The join study used 256 MB work_mem, JIT off, a 131,072-row GPU probe batch, one warmup and five measured rounds. Serial native and the forced CUDA modes disallowed parallel workers. Tuned native allowed four workers per gather. Dense, compact and auto are output modes of the same forced CUDA operator. The auto comparison tests output representation selection after the operator is chosen. Result checks compared query outputs independently of timings.
 
-<!-- JOIN SQL -->
 | Scale | Case | Serial native (s) | Tuned native (s) | CUDA dense (s) | CUDA compact (s) | CUDA auto (s) | Native join + GFTR (s) |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | SF1 | orders_broad | 2.140 [2.088–2.244] | 0.618 [0.613–0.621] | 1.364 [1.345–1.400] | 1.358 [1.347–1.392] | 1.363 [1.332–1.379] | — |
@@ -114,7 +111,6 @@ The join study used 256 MB work_mem, JIT off, a 131,072-row GPU probe batch, one
 | SF5 | part_payload | 21.039 [18.854–22.716] | 4.708 [4.598–4.802] | 10.380 [9.760–12.622] | 11.341 [10.504–12.503] | 10.812 [10.336–12.413] | — |
 | SF5 | supplier_grouped | 11.971 [10.945–12.100] | 2.461 [2.380–2.535] | 11.193 [10.878–11.728] | 11.425 [10.819–11.721] | 11.401 [10.927–11.644] | 9.563 [9.437–9.831] |
 | SF5 | supplier_projected | 0.037 [0.035–0.038] | 0.036 [0.035–0.036] | 0.038 [0.037–0.038] | 0.040 [0.039–0.041] | 0.037 [0.037–0.038] | — |
-<!-- END JOIN SQL -->
 
 Brackets show the measured range. All five SQL shapes preserve their output descriptions across modes, as checked by `join-sql/join-types.json`.
 
@@ -175,7 +171,7 @@ The calibration matched about 2,000 to 200,000 probe rows. Between the narrow 1%
 
 The model sums predicted scan and packing, GPU build and probe, host-to-device and device-to-host transfers, and a fitted host residual. It selects compaction below an estimated 10% match rate. Held-out features use the probe size from calibration, the dimension key range and a uniform match estimate. The measured tuned native time supplies the comparison threshold. We wrote the model output and input digests before launching the held-out CUDA tests. This measures transfer across query shapes with a known native runtime.
 
-The frozen model predicted the native winner and the CUDA output mode in all eight held-out cases. Every result digest matched across the two systems. CUDA predictions were 3.75–10.73 ms high, with a mean absolute relative error of 11.42%. The measured ranges are based on three rounds after a warmup. All eight validation cells favored native, so this accuracy measures one outcome class. The ordinary SQL matrix above includes a separate GPU win outside this grid.
+The frozen model predicted the native winner and the CUDA output mode in all eight held-out cases. Every result digest matched across execution modes. In all eight cases, probe scan and packing alone took 42.50–47.73 ms and exceeded the tuned native query time. Measured transfers totaled 0.65–0.95 ms. CUDA predictions were 3.75–10.73 ms high, with a mean absolute relative error of 11.42%. The measured ranges are based on three rounds after a warmup. All eight validation cells favored native, so this accuracy measures one outcome class. The ordinary SQL matrix above includes a separate GPU win outside this grid.
 
 | Actual matches | Projected columns | Predicted CUDA (ms) | Measured CUDA (ms) | Tuned native (ms) |
 | ---: | ---: | ---: | ---: | ---: |
