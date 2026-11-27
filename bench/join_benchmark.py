@@ -139,8 +139,14 @@ def configure(args, mode, workers=None):
             settings.append("RESET max_parallel_workers_per_gather;")
         else:
             settings.append(f"SET max_parallel_workers_per_gather={workers};")
-    if mode in CUSTOM_JOIN_MODES:
-        backend = "cpu" if mode in ("cpu", "fused_cpu") else "cuda"
+    if mode == "fused_cpu":
+        settings += [
+            "SET pg_gftr.join_enabled=off;",
+            "SET pg_gftr.join_force=off;",
+            "SET pg_gftr.join_backend='cpu';",
+        ]
+    elif mode in CUSTOM_JOIN_MODES:
+        backend = "cpu" if mode == "cpu" else "cuda"
         settings += [
             "SET pg_gftr.join_enabled=on;",
             f"SET pg_gftr.join_force={'off' if mode == 'auto' else 'on'};",

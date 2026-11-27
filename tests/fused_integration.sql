@@ -2,8 +2,8 @@
 LOAD 'pg_gftr';
 SET pg_gftr.enabled = off;
 SET pg_gftr.join_backend = 'cpu';
-SET pg_gftr.join_enabled = on;
-SET pg_gftr.join_force = on;
+SET pg_gftr.join_enabled = off;
+SET pg_gftr.join_force = off;
 SET pg_gftr.fused_enabled = on;
 SET pg_gftr.fused_force = on;
 SET max_parallel_workers_per_gather = 0;
@@ -38,7 +38,6 @@ BEGIN
     PERFORM set_config('pg_gftr.fused_enabled', 'off', true);
     EXECUTE 'CREATE TEMP TABLE fused_expected AS ' || q;
 
-    PERFORM set_config('pg_gftr.join_enabled', 'on', true);
     PERFORM set_config('pg_gftr.fused_enabled', 'on', true);
     EXECUTE 'EXPLAIN (FORMAT JSON) ' || q INTO plan;
     IF (plan::text LIKE '%GftrFusedJoinAggregate%') <> expected OR
@@ -79,11 +78,11 @@ SELECT pg_temp.assert_fused(
 SELECT pg_temp.assert_fused(
     'SELECT d.grp, count(*) FROM fused_fact f JOIN fused_nonunique d USING (id) GROUP BY d.grp', false, true);
 SELECT pg_temp.assert_fused(
-    'SELECT d.grp, count(*), sum(d.id) FROM fused_fact f JOIN fused_dim d USING (id) GROUP BY d.grp', false);
+    'SELECT d.grp, count(*), sum(d.id) FROM fused_fact f JOIN fused_dim d USING (id) GROUP BY d.grp', false, true);
 SELECT pg_temp.assert_fused(
-    'SELECT d.grp, count(*), sum(f.value) FILTER (WHERE f.value > 0) FROM fused_fact f JOIN fused_dim d USING (id) GROUP BY d.grp', false);
+    'SELECT d.grp, count(*), sum(f.value) FILTER (WHERE f.value > 0) FROM fused_fact f JOIN fused_dim d USING (id) GROUP BY d.grp', false, true);
 SELECT pg_temp.assert_fused(
-    'SELECT f.grp, count(*) FROM fused_fact f JOIN fused_dim d USING (id) GROUP BY f.grp', false);
+    'SELECT f.grp, count(*) FROM fused_fact f JOIN fused_dim d USING (id) GROUP BY f.grp', false, true);
 
 SELECT pg_temp.assert_fused(
     'SELECT d.grp, count(*) AS c1, count(*) AS c2, sum(f.value) FROM fused_fact f JOIN fused_dim d USING (id) GROUP BY d.grp ORDER BY c1 DESC, d.grp LIMIT 2', true);
@@ -96,6 +95,7 @@ PREPARE fused_query(int) AS
     FROM fused_fact f JOIN fused_dim d USING (id)
     WHERE f.value < $1 GROUP BY d.grp ORDER BY d.grp;
 EXPLAIN (COSTS OFF) EXECUTE fused_query(42);
+SET pg_gftr.join_backend = 'cuda';
 EXECUTE fused_query(42);
 EXECUTE fused_query(105);
 DEALLOCATE fused_query;
