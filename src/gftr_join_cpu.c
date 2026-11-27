@@ -32,9 +32,9 @@ gftr_join_cpu_free(GftrJoinBuild *build)
 }
 
 int
-gftr_join_cpu_build(const int32_t *keys, int32_t count, size_t budget,
-					GftrJoinBuild **out, GftrJoinTiming *timing,
-					char error[GFTR_ERROR_SIZE])
+gftr_join_cpu_build_groups(const int32_t *keys, const int32_t *groups,
+						   int32_t count, size_t budget, GftrJoinBuild **out,
+						   GftrJoinTiming *timing, char error[GFTR_ERROR_SIZE])
 {
 	const char *message;
 	GftrJoinLayout layout;
@@ -79,7 +79,7 @@ gftr_join_cpu_build(const int32_t *keys, int32_t count, size_t budget,
 
 			if (table[slot] != -1)
 				goto fail;
-			table[slot] = i;
+			table[slot] = groups ? groups[i] : i;
 		}
 	}
 	else
@@ -97,7 +97,7 @@ gftr_join_cpu_build(const int32_t *keys, int32_t count, size_t budget,
 					goto fail;
 				slot = (slot + 1) & mask;
 			}
-			table[slot] = gftr_join_entry(keys[i], i);
+			table[slot] = gftr_join_entry(keys[i], groups ? groups[i] : i);
 		}
 	}
 
@@ -111,6 +111,22 @@ fail:
 	gftr_join_cpu_free(build);
 	snprintf(error, GFTR_ERROR_SIZE, "%s", message);
 	return -1;
+}
+
+int
+gftr_join_cpu_build(const int32_t *keys, int32_t count, size_t budget,
+					GftrJoinBuild **out, GftrJoinTiming *timing,
+					char error[GFTR_ERROR_SIZE])
+{
+	return gftr_join_cpu_build_groups(keys, NULL, count, budget, out, timing, error);
+}
+
+int32_t
+gftr_join_cpu_lookup(const GftrJoinBuild *build, int32_t key)
+{
+	if (build->layout.dense)
+		return gftr_join_dense_lookup(build->table, build->layout, key);
+	return gftr_join_hash_lookup(build->table, build->layout.slots, key);
 }
 
 int
