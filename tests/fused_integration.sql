@@ -95,7 +95,7 @@ PREPARE fused_query(int) AS
     FROM fused_fact f JOIN fused_dim d USING (id)
     WHERE f.value < $1 GROUP BY d.grp ORDER BY d.grp;
 EXPLAIN (COSTS OFF) EXECUTE fused_query(42);
-SET pg_gftr.join_backend = 'cuda';
+SET pg_gftr.join_backend = 'cpu';
 EXECUTE fused_query(42);
 EXECUTE fused_query(105);
 DEALLOCATE fused_query;
