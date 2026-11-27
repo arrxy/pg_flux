@@ -78,7 +78,7 @@ def benchmark(args, case):
         "SELECT version();",
         "SELECT extname, extversion FROM pg_extension WHERE extname IN ('pg_strom','pg_gftr') ORDER BY 1;",
     ])
-    for mode in MODES:
+    for mode in args.modes:
         setup.extend(set_mode(mode, case, args.prefer_gpu))
         record(f'settings_{mode}', [SETTINGS.strip()])
         if args.screen:
@@ -94,7 +94,7 @@ def benchmark(args, case):
     if not args.screen:
         rng = random.Random(1831)
         for index in range(args.trials + 1):
-            order = list(MODES)
+            order = list(args.modes)
             rng.shuffle(order)
             rounds.append(order)
             for mode in order:
@@ -112,12 +112,12 @@ def benchmark(args, case):
     chunks = MARKER.split((target / 'stdout.txt').read_text())
     records = dict(zip(chunks[1::2], (item.strip() for item in chunks[2::2])))
     report = {'case': case, 'sql': query, 'versions': records['versions'],
-              'settings': {mode: json.loads(records[f'settings_{mode}']) for mode in MODES},
+              'settings': {mode: json.loads(records[f'settings_{mode}']) for mode in args.modes},
               'prefer_gpu': args.prefer_gpu, 'rounds': rounds, 'plans': [],
               'exact_checks': {}, 'measurements': {}}
 
     expected_rows = None
-    for mode in MODES:
+    for mode in args.modes:
         if not args.screen:
             path = target / f'rows_{mode}.txt'
             rows = sorted(path.read_bytes().splitlines(keepends=True))
@@ -146,13 +146,13 @@ def benchmark(args, case):
                 'median_ms': statistics.median(times), 'min_ms': min(times), 'max_ms': max(times),
             }
     if not args.screen:
-        for mode in MODES:
+        for mode in args.modes:
             (target / f'rows_{mode}.txt').unlink()
     (target / 'report.json').write_text(json.dumps(report, indent=2) + '\n')
     print(json.dumps({'case': case, 'measurements': report['measurements'],
                       'providers': {mode: sorted({p for node in report['plans']
                                                  if node['mode'] == mode for p in node['providers']})
-                                    for mode in MODES}}), flush=True)
+                                    for mode in args.modes}}), flush=True)
 
 
 def main():
@@ -161,11 +161,15 @@ def main():
     parser.add_argument('--dbname', default='tpch_sf1')
     parser.add_argument('--output', required=True, type=Path)
     parser.add_argument('--cases', choices=CASES, nargs='+', default=['A1', 'A2', 'orders_broad'])
+    parser.add_argument('--modes', choices=MODES, nargs='+', default=list(MODES))
     parser.add_argument('--trials', type=int, default=5)
     parser.add_argument('--screen', action='store_true')
     parser.add_argument('--prefer-gpu', action='store_true',
                         help='test PG-Strom with zero GPU setup and transfer tuple cost')
     args = parser.parse_args()
+    if 'native_tuned' not in args.modes or len(args.modes) != len(set(args.modes)):
+        parser.error('modes must include native_tuned and contain no duplicates')
+    args.modes = [mode for mode in MODES if mode in args.modes]
     if args.trials < 1:
         parser.error('at least one timed trial is required')
     for case in args.cases:
