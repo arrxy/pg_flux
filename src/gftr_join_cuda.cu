@@ -99,8 +99,8 @@ __global__ void compact_matches(const int32_t *matches, int32_t count,
                                 MatchPair *pairs, unsigned capacity,
                                 unsigned *hits)
 {
-    int32_t row = blockIdx.x * blockDim.x + threadIdx.x;
-    int32_t match = row < count ? matches[row] : -1;
+    unsigned row = blockIdx.x * blockDim.x + threadIdx.x;
+    int32_t match = row < static_cast<unsigned>(count) ? matches[row] : -1;
     unsigned mask = __ballot_sync(0xffffffff, match >= 0);
     if (mask == 0)
         return;
@@ -109,7 +109,7 @@ __global__ void compact_matches(const int32_t *matches, int32_t count,
     first = __shfl_sync(0xffffffff, first, 0);
     unsigned index = first + __popc(mask & ((1u << lane) - 1));
     if (match >= 0 && index < capacity)
-        pairs[index] = {row, match};
+        pairs[index] = {static_cast<int32_t>(row), match};
 }
 
 struct CudaJoinBuild {

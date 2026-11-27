@@ -1,8 +1,8 @@
 # pg_gftr
 
 An experimental PostgreSQL **18** extension implementing GPU sort-based
-grouped aggregation with GFTR (gather from transformed relations). PostgreSQL
-core does not need patches. Build targets include RTX A6000 (**sm_86**) and
+grouped aggregation with GFTR (gather from transformed relations) and
+batched CUDA joins. PostgreSQL core does not need patches. Build targets include RTX A6000 (**sm_86**) and
 A100 (**sm_80**).
 
 This is the first aggregation milestone from *Efficiently Processing Joins and
