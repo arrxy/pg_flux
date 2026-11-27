@@ -45,9 +45,10 @@ FROM (
 GROUP BY s.s_nationkey
 ORDER BY s.s_nationkey"""
 MODES = ("native", "native_tuned", "cpu", "cuda", "native_gpu_agg", "auto",
-         "fused_cpu", "native_preagg")
-CUSTOM_JOIN_MODES = ("cpu", "cuda", "auto", "fused_cpu")
-GROUPED_MODES = ("native_gpu_agg", "fused_cpu", "native_preagg")
+         "fused_cpu", "native_preagg", "fused_parallel")
+FUSED_MODES = ("fused_cpu", "fused_parallel")
+CUSTOM_JOIN_MODES = ("cpu", "cuda", "auto") + FUSED_MODES
+GROUPED_MODES = ("native_gpu_agg", "native_preagg") + FUSED_MODES
 NATIVE_MODES = ("native", "native_tuned", "native_preagg")
 RECORD = re.compile(r"^GFTR_JOIN_RECORD (\w+)$", re.MULTILINE)
 SETTINGS = (
@@ -79,6 +80,9 @@ def arguments():
     parallelism.add_argument("--native-worker-sweep", nargs="+", type=int,
                              metavar="N", help="benchmark each native mode with each limit "
                              "for max_parallel_workers_per_gather, e.g. 0 2 4")
+    parser.add_argument("--fused-worker-sweep", nargs="+", type=int, metavar="N",
+                        help="benchmark fused_parallel with each positive limit for "
+                        "max_parallel_workers_per_gather, e.g. 2 4")
     parser.add_argument("--disable-jit", action="store_true")
     parser.add_argument("--tuned-work-mem-mb", type=int, default=256)
     parser.add_argument("--join-batch-rows", type=int, default=131_072)
@@ -101,6 +105,14 @@ def arguments():
             parser.error("--native-worker-sweep requires distinct nonnegative worker counts")
         if not set(args.modes).intersection(NATIVE_MODES):
             parser.error("--native-worker-sweep requires a native mode")
+    if "fused_parallel" in args.modes and args.serial:
+        parser.error("fused_parallel requires parallel workers")
+    if args.fused_worker_sweep is not None:
+        workers = args.fused_worker_sweep
+        if min(workers) < 1 or len(set(workers)) != len(workers):
+            parser.error("--fused-worker-sweep requires distinct positive worker counts")
+        if "fused_parallel" not in args.modes or "supplier_grouped" not in args.cases:
+            parser.error("--fused-worker-sweep requires fused_parallel and supplier_grouped")
     if not any(case_modes(args, case) for case in args.cases):
         parser.error(f"{', '.join(GROUPED_MODES)} apply to supplier_grouped only")
     return args
@@ -114,11 +126,16 @@ def case_modes(args, case):
 def mode_variants(args, case):
     variants = {}
     for mode in case_modes(args, case):
-        if mode in NATIVE_MODES and args.native_worker_sweep is not None:
-            for workers in args.native_worker_sweep:
-                variants[f"{mode}_w{workers}"] = (mode, workers)
-        else:
+        worker_limits = None
+        if mode in NATIVE_MODES:
+            worker_limits = args.native_worker_sweep
+        elif mode == "fused_parallel":
+            worker_limits = args.fused_worker_sweep
+        if worker_limits is None:
             variants[mode] = (mode, None)
+        else:
+            for workers in worker_limits:
+                variants[f"{mode}_w{workers}"] = (mode, workers)
     return variants
 
 
@@ -134,12 +151,11 @@ def configure(args, mode, workers=None):
         if mode == "native_tuned" else "RESET work_mem;",
         f"SET pg_gftr.enabled={'on' if mode == 'native_gpu_agg' else 'off'};",
     ]
-    if args.native_worker_sweep is not None:
-        if workers is None:
-            settings.append("RESET max_parallel_workers_per_gather;")
-        else:
-            settings.append(f"SET max_parallel_workers_per_gather={workers};")
-    if mode == "fused_cpu":
+    if workers is not None:
+        settings.append(f"SET max_parallel_workers_per_gather={workers};")
+    elif args.native_worker_sweep is not None or args.fused_worker_sweep is not None:
+        settings.append("RESET max_parallel_workers_per_gather;")
+    if mode in FUSED_MODES:
         settings += [
             "SET pg_gftr.join_enabled=off;",
             "SET pg_gftr.join_force=off;",
@@ -158,8 +174,16 @@ def configure(args, mode, workers=None):
             "SELECT 'SET pg_gftr.join_enabled=off;' "
             "WHERE current_setting('pg_gftr.join_enabled', true) IS NOT NULL \\gexec"
         )
-    if mode == "fused_cpu":
+    if mode in FUSED_MODES:
         settings += ["SET pg_gftr.fused_enabled=on;", "SET pg_gftr.fused_force=on;"]
+        if mode == "fused_parallel":
+            settings.append("SET pg_gftr.fused_parallel=on;")
+        else:
+            # Run the serial control against builds from before parallel fusion.
+            settings.append(
+                "SELECT 'SET pg_gftr.fused_parallel=off;' "
+                "WHERE current_setting('pg_gftr.fused_parallel', true) IS NOT NULL \\gexec"
+            )
     else:
         # Older builds have no fused GUC. Native and existing modes still work.
         settings.append(
@@ -246,11 +270,16 @@ def check_plan(plan, case, mode):
                     if node.get("Custom Plan Provider") == "GftrAggregate"]
     fused = [node for node in nodes
              if node.get("Custom Plan Provider") == "GftrFusedJoinAggregate"]
-    if len(fused) != int(mode == "fused_cpu"):
+    if len(fused) != int(mode in FUSED_MODES):
         raise ValueError(f"{case}/{mode} expected a different number of GftrFusedJoinAggregate nodes")
     if fused and fused[0].get("Backend") != "CPU":
         raise ValueError(f"{case}/{mode} expected the CPU backend at GftrFusedJoinAggregate")
-    if mode != "auto" and len(joins) != int(mode in ("cpu", "cuda", "fused_cpu")):
+    is_parallel = mode == "fused_parallel"
+    if fused and bool(fused[0].get("Partial", False)) != is_parallel:
+        raise ValueError(f"{case}/{mode} has an unexpected fused partial aggregate setting")
+    if is_parallel:
+        check_parallel_fusion(nodes, fused[0], case)
+    if mode != "auto" and len(joins) != int(mode in ("cpu", "cuda", *FUSED_MODES)):
         raise ValueError(f"{case}/{mode} expected a different number of GftrJoin nodes")
     if len(aggregations) != int(mode == "native_gpu_agg"):
         raise ValueError(f"{case}/{mode} expected a different number of GftrAggregate nodes")
@@ -266,11 +295,26 @@ def check_plan(plan, case, mode):
         raise ValueError(f"{case}/{mode} has no aggregate below a native join")
     for node in joins:
         backend = str(node.get("Backend", "")).lower()
-        expected = "cpu" if mode in ("cpu", "fused_cpu") else "cuda"
+        expected = "cpu" if mode in ("cpu", *FUSED_MODES) else "cuda"
         if expected not in backend:
             raise ValueError(f"{case}/{mode} expected the {expected} backend, got {backend!r}")
     return [{key: value for key, value in node.items() if key != "Plans"}
             for node in [*fused, *joins, *aggregations, *native_joins]]
+
+
+def check_parallel_fusion(nodes, partial, case):
+    for final in nodes:
+        if final.get("Node Type") != "Aggregate" or final.get("Partial Mode") != "Finalize":
+            continue
+        for gather in walk_nodes(final):
+            if gather.get("Node Type") not in ("Gather", "Gather Merge"):
+                continue
+            if any(node is partial for node in walk_nodes(gather)):
+                if gather.get("Workers Launched", 0) < 1:
+                    raise ValueError(f"{case}/fused_parallel Gather launched no workers")
+                return
+    raise ValueError(f"{case}/fused_parallel expected Finalize Aggregate above Gather "
+                     "and partial GftrFusedJoinAggregate below Gather")
 
 
 def count_workers(plan, field):
