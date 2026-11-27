@@ -88,3 +88,21 @@ FETCH FORWARD 10 FROM join_cursor;
 FETCH BACKWARD 5 FROM join_cursor;
 CLOSE join_cursor;
 COMMIT;
+
+SELECT pg_temp.assert_join(
+    'SELECT x, (SELECT count(*) FROM join_probe p JOIN join_build b ON p.k = b.k WHERE p.payload < x) AS hits FROM generate_series(10,50,10) x', true);
+
+DO $$
+BEGIN
+    PERFORM set_config('pg_gftr.join_max_host_mb', '1', true);
+    PERFORM set_config('pg_gftr.join_batch_rows', '1048576', true);
+    BEGIN
+        EXECUTE 'SELECT p.payload FROM join_probe p JOIN join_build b USING (k)';
+        RAISE EXCEPTION 'join host budget was not enforced';
+    EXCEPTION WHEN program_limit_exceeded THEN
+        NULL;
+    END;
+    PERFORM set_config('pg_gftr.join_batch_rows', '17', true);
+    PERFORM pg_temp.assert_join(
+        'SELECT p.payload FROM join_probe p JOIN join_build b USING (k)', true);
+END $$;
