@@ -27,3 +27,28 @@ python3 bench/join_benchmark.py --dbname tpch_sf1 tpch_sf5 \
   --cases supplier_grouped --modes native native_preagg fused_cpu \
   --native-worker-sweep 0 2 4 --trials 3 --warmups 1 --output results/fused-main
 ```
+
+## Serial fused and native execution
+
+| Plan | Workers launched | SF1 | SF5 |
+| --- | ---: | ---: | ---: |
+| Native join and aggregation | 0 | 2,288 ms | 12,107 ms |
+| Native join and aggregation | 2 | 812 ms | 4,190 ms |
+| Native join and aggregation | 4 | 485 ms | 2,500 ms |
+| Native fact preaggregation | 0 | 1,730 ms | 9,259 ms |
+| Native fact preaggregation | 2 | 617 ms | 3,195 ms |
+| Native fact preaggregation | 4 | 373 ms | 1,948 ms |
+| Fused CPU | 0 | 1,080 ms | 5,779 ms |
+
+Serial fusion cut elapsed time by 53% at SF1 and 52% at SF5 against serial
+native execution. The fused SF5 node spent 15 ms building and about 5,763 ms
+scanning the probe child and reducing the rows. The 25-group final output
+is small. PostgreSQL's parallel native plan has a substantial advantage
+even after the fused operator removes the joined output boundary. Fact
+preaggregation with four workers is the strongest native reference in this
+experiment.
+
+All result digests matched. The serial path also passed exact SQL multiset
+and type comparisons on fixtures covering NULL groups and join keys, all-NULL
+sums, signed extremes, missing keys, duplicates on the probe side, empty
+builds, rescan and unsupported query shapes.
