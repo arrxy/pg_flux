@@ -97,6 +97,7 @@ struct CudaJoinBuild {
     uint8_t *table = nullptr;
     int32_t *build_keys = nullptr;
     int *duplicate = nullptr;
+    int has_duplicate = 0;
     int32_t *probe_keys = nullptr;
     uint8_t *probe_valid = nullptr;
     int32_t *matches = nullptr;
@@ -181,7 +182,6 @@ struct CudaJoinBuild {
                 table, layout, build_keys, count, duplicate);
         check(cudaGetLastError(), "launch join build kernel");
         record(2);
-        int has_duplicate = 0;
         check(cudaMemcpyAsync(&has_duplicate, duplicate, sizeof(int), cudaMemcpyDeviceToHost,
                               stream), "read join duplicate flag");
         finish();
