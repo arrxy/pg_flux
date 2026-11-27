@@ -23,6 +23,7 @@
 
 #define MIB ((size_t) 1024 * 1024)
 #define JOIN_MIN_BUILD_CAPACITY 4096
+#define JOIN_OUTPUT_SAMPLE_INTERVAL 1024
 
 typedef enum JoinSide
 {
@@ -78,6 +79,9 @@ typedef struct GftrJoinState
 	GftrJoinTiming timing;
 	double build_pack_ms;
 	double probe_pack_ms;
+	double output_sample_ms;
+	uint64 output_samples;
+	bool profile_output;
 	uint64 probe_rows;
 	uint64 output_rows;
 	uint64 batches;
@@ -358,6 +362,7 @@ join_begin(CustomScanState *node, EState *estate, int eflags)
 
 	state->context = estate->es_query_cxt;
 	state->backend = join_backend;
+	state->profile_output = estate->es_instrument != 0;
 	state->device = atoi(GetConfigOption("pg_gftr.device", false, false));
 	state->batch_rows = join_batch_rows;
 	state->host_budget = (size_t) join_max_host_mb * MIB;
@@ -606,6 +611,8 @@ join_next(ScanState *scan)
 		int probe_row;
 		int build_row;
 		int col;
+		bool sample;
+		instr_time start;
 
 		CHECK_FOR_INTERRUPTS();
 		if (state->next_row >= probe->count)
@@ -623,6 +630,11 @@ join_next(ScanState *scan)
 		if (build_row >= state->inputs[JOIN_BUILD].count)
 			elog(ERROR, "pg_gftr join returned an invalid build row index");
 
+		/* Timing every output tuple adds measurable overhead on large joins. */
+		sample = state->profile_output &&
+			state->output_rows % JOIN_OUTPUT_SAMPLE_INTERVAL == 0;
+		if (sample)
+			INSTR_TIME_SET_CURRENT(start);
 		for (col = 0; col < state->noutputs; col++)
 		{
 			JoinOutput *source = &state->outputs[col];
@@ -644,7 +656,13 @@ join_next(ScanState *scan)
 		}
 
 		state->output_rows++;
-		return ExecStoreVirtualTuple(slot);
+		ExecStoreVirtualTuple(slot);
+		if (sample)
+		{
+			state->output_sample_ms += elapsed_ms(start);
+			state->output_samples++;
+		}
+		return slot;
 	}
 }
 
@@ -689,6 +707,8 @@ join_rescan(CustomScanState *node)
 	state->batches = 0;
 	state->build_pack_ms = 0;
 	state->probe_pack_ms = 0;
+	state->output_sample_ms = 0;
+	state->output_samples = 0;
 	memset(&state->timing, 0, sizeof(state->timing));
 
 	for (side = JOIN_PROBE; side <= JOIN_BUILD; side++)
@@ -725,6 +745,9 @@ join_explain(CustomScanState *node, List *ancestors, ExplainState *es)
 		ExplainPropertyUInteger("D2H Bytes", NULL, state->timing.d2h_bytes, es);
 		ExplainPropertyFloat("Build Scan and Pack", "ms", state->build_pack_ms, 3, es);
 		ExplainPropertyFloat("Probe Scan and Pack", "ms", state->probe_pack_ms, 3, es);
+		if (state->output_samples)
+			ExplainPropertyFloat("Estimated Output Materialization", "ms",
+				state->output_sample_ms * state->output_rows / state->output_samples, 3, es);
 		ExplainPropertyFloat("Build", "ms", state->timing.build_ms, 3, es);
 		ExplainPropertyFloat("H2D", "ms", state->timing.h2d_ms, 3, es);
 		ExplainPropertyFloat("Probe", "ms", state->timing.probe_ms, 3, es);
