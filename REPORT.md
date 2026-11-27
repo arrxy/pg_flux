@@ -44,6 +44,12 @@ The A100 runs used JIT off and 256 MB work_mem. GPU selection was forced for sup
 
 Brackets show the measured range. Each focal case has its own sampled plans and result signatures in `aggregation-sql/sf*/timed/`. GFTR beat serial native in ten of ten cases. A2 and A3 were the only cases that launched native workers, and those plans beat both GPU modes. The four-worker setting left A1, A4 and Q13 serial at both scales. The sampled native focal plans reported zero temporary blocks written.
 
+### Standard query coverage
+
+All 22 standard shapes were screened at each scale. Q13 was the only plan showing the CUDA aggregate, and its executed CUDA plans passed the exact check. The SF1 timings cover 20 standard queries. Q17 and Q20 hit the five-minute statement limit during native result validation. Their plans contain correlated sequential scans of lineitem with the loaded primary-key indexes. The failed SQL and error logs are included.
+
+The October report does not identify its ten timed SF5 standard queries. We selected Q1, Q3, Q4, Q5, Q6, Q9, Q12, Q13, Q14 and Q19 for this study. <!-- STANDARD SF5 RESULTS --> Timing differences in plans that stayed native are evidence about variation on the host and do not measure accelerator throughput.
+
 ### October RTX A6000 reference
 
 The October 24 progress report supplied these medians in seconds. The A100 workloads use the documented grouping keys and operator shapes. The original custom SQL, standard substitutions and SF5 subset list were unavailable, so the two tables provide a historical comparison by workload shape. They do not isolate a GPU model effect.
