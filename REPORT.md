@@ -16,7 +16,7 @@ We tested whether GPU execution accelerates joins and grouped aggregations in Po
 
 ## Environment and measurement
 
-- NVIDIA A100-SXM4-80GB, AMD EPYC host, NVIDIA driver 610.43.02, CUDA 12.6 (nvcc 12.6.85), PostgreSQL 18.6, extension 0.1.1, sm_80. The tested extension implementation is the one on `gpu-resident-sql` at `34085f6`. The report branch also contains benchmark instrumentation and drivers.
+- NVIDIA A100-SXM4-80GB, AMD EPYC host, NVIDIA driver 610.43.02, CUDA 12.6 (nvcc 12.6.85), PostgreSQL 18.6, extension 0.1.1, sm_80. The tested extension implementation is the one on `gpu-resident-sql` at `34085f6`. The report branch also contains benchmark drivers.
 - The A100 datasets were generated and loaded on the host. SF1 and SF5 contain 6,001,215 and 29,999,795 lineitem rows. Both have the eight TPC-H tables and their primary-key indexes. Earlier RTX A6000 values come from the October 24 progress report. Differences between hosts, builds and workload reconstruction limit a direct hardware comparison.
 - Full SQL timings use PostgreSQL server execution time. This includes execution-time scans, packing, transfers and result consumption inside the plan. Planning and normal client result delivery are outside that boundary. Cache dropping was disabled. CUDA timings identify whether data were already resident and whether they include allocation, upload and transformation. Ratios use baseline divided by candidate.
 - The A100 verified the standalone CPU cases, 72 aggregation fixtures in each CUDA mode (144 GPU runs), CUDA join backend, and PostgreSQL integration for GFTR, GFUR, CUDA joins and the resident SQL API. The benchmark harness smoke test matched its checksums. These are controlled TPC-H workload measurements. The paper used an A100 40 GB and CUDA 12.2.
@@ -105,13 +105,17 @@ The join study used 256 MB work_mem, JIT off, a 131,072-row GPU probe batch, one
 | SF1 | supplier_projected | 0.038 [0.034–0.042] | 0.038 [0.033–0.042] | 0.027 [0.027–0.029] | 0.029 [0.028–0.031] | 0.027 [0.027–0.029] | — |
 | SF5 | orders_broad | 11.910 [11.174–12.233] | 3.149 [3.117–3.158] | 6.805 [6.697–6.981] | 6.883 [6.787–7.244] | 6.768 [6.625–7.006] | — |
 | SF5 | orders_selective | 7.723 [6.138–7.768] | 1.502 [1.437–1.533] | 7.041 [6.896–7.249] | 6.981 [6.551–8.046] | 7.539 [6.630–7.849] | — |
+| SF5 | part_payload | 21.039 [18.854–22.716] | 4.708 [4.598–4.802] | 10.380 [9.760–12.622] | 11.341 [10.504–12.503] | 10.812 [10.336–12.413] | — |
+| SF5 | supplier_grouped | 11.971 [10.945–12.100] | 2.461 [2.380–2.535] | 11.193 [10.878–11.728] | 11.425 [10.819–11.721] | 11.401 [10.927–11.644] | 9.563 [9.437–9.831] |
+| SF5 | supplier_projected | 0.037 [0.035–0.038] | 0.036 [0.035–0.036] | 0.038 [0.037–0.038] | 0.040 [0.039–0.041] | 0.037 [0.037–0.038] | — |
 <!-- END JOIN SQL -->
 
 Brackets show the measured range. All five SQL shapes preserve their output descriptions across modes, as checked by `join-sql/join-types.json`.
 
 - **Selective order join.** The SF5 match rate was 1.30%. Auto compacted 229 of 229 batches and reduced device-to-host match metadata from 119,999,184 to 3,109,680 bytes (97.4%). The device-to-host phase fell from 44.37 to 10.65 ms. Dense, compact and auto SQL ranges overlap. Tuned PostgreSQL used a four-worker hash join at SF5 and a three-worker nested loop with index access at SF1.
 - **Broad order join.** Auto used dense output in all batches. At SF5, forcing compaction still used the dense fallback on all 229 batches. Median probe time increased from 3.63 to 10.73 ms and match output grew by 916 bytes of control metadata. Auto beat serial native by 1.76× but took 2.15× as long as tuned native.
-- **Bounded supplier projection at SF1.** CUDA dense took 27.30 ms versus 38.17 ms for tuned native (1.40×), with disjoint measured ranges. Both used the lineitem primary-key range scan. The CUDA plan built a lookup from 10,000 suppliers and matched all 40,278 probe rows. The native plan used a nested loop with memoized supplier index lookups and launched zero workers.
+- **Bounded supplier projection at SF1.** CUDA dense took 27.30 ms versus 38.17 ms for tuned native (1.40×), with disjoint measured ranges. Both used the lineitem primary-key range scan. The CUDA plan built a lookup from 10,000 suppliers and matched all 40,278 probe rows. The native plan used a nested loop with memoized supplier index lookups and launched zero workers. At SF5, tuned native took 35.64 ms versus 37.35 ms for the fastest CUDA mode.
+- **Joined aggregation.** At SF5 the supplier-nation workload took 9.56 s with a native join and GFTR aggregate, 11.19 s with the fastest forced CUDA join, and 2.46 s with the four-worker native plan. Native plans won nine of the ten comparisons against the fastest ordinary CUDA join mode.
 - **Host work.** The custom scan packs input tuples, sends batches, then constructs PostgreSQL output slots on the host. The device-to-host byte counts cover match metadata. The SF5 selective auto plan recorded separate build and probe scan/pack medians of 1.27 s and 5.49 s. Raw plans and per-mode transfer counters are in `join-sql/`.
 
 ## Transformed join payloads and device residency
