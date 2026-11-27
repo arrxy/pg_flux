@@ -159,6 +159,33 @@ The follow-up at SF1 favored the resident path in three more paired two-executio
 
 All these sums use server execution time and include the resident loader. The scope is one explicit snapshot and one fixed query. PostgreSQL's ordinary planner uses the separate SQL join path above. Raw evidence is in `join-residency/*-summary.json` and its accompanying SQL and session logs.
 
+## When GPU offload pays
+
+### Selectivity and width
+
+We calibrated a phase model on eight SF1 lineitem–part joins, then tested it on eight different lineitem–supplier joins. The queries use the same lineitem order-key range and filter the dimension's integer primary key. Target match fractions are 1%, 5%, 50% and 100%, with two SQL projection widths. The wide query consumes additional lineitem columns. Both widths return a handful of scalar aggregates, so the results concern host tuple processing as well as GPU match metadata transfers. The separate resident join ablation above measures the cost of gathering actual multi-column device payloads.
+
+The calibration matched about 2,000 to 200,000 probe rows. Between the narrow 1% and 100% cases, return traffic changed from 15,764 to 801,460 bytes while probe scan and pack stayed near 49–51 ms. CUDA auto took 64.66 and 93.04 ms versus 23.97 and 68.42 ms for tuned PostgreSQL. At 100% matches, broadening the projection increased the CUDA median from 93.04 to 115.28 ms with unchanged match metadata bytes. The measured host residual increased from 17.93 to 36.83 ms. This residual includes uninstrumented execution above and inside the join.
+
+The model sums predicted scan and packing, GPU build and probe, host-to-device and device-to-host transfers, and a fitted host residual. It selects compaction below an estimated 10% match rate. Held-out features use the probe size from calibration, the dimension key range and a uniform match estimate. The measured tuned native time supplies the comparison threshold. We wrote the model output and input digests before launching the held-out CUDA tests. This measures transfer across query shapes with a known native runtime.
+
+The frozen model predicted the native winner and the CUDA output mode in all eight held-out cases. Every result digest matched across the two systems. CUDA predictions were 3.75–10.73 ms high, with a mean absolute relative error of 11.42%. The measured ranges are based on three rounds after a warmup. All eight validation cells favored native, so this accuracy measures one outcome class. The ordinary SQL matrix above includes a separate GPU win outside this grid.
+
+| Actual matches | Projected columns | Predicted CUDA (ms) | Measured CUDA (ms) | Tuned native (ms) |
+| ---: | ---: | ---: | ---: | ---: |
+| 0.96% | 1 | 63.73 | 57.04 [53.07–59.71] | 20.78 [20.65–20.95] |
+| 0.96% | 4 | 66.24 | 62.49 [56.18–64.12] | 20.75 [19.90–20.90] |
+| 4.94% | 1 | 64.27 | 60.16 [55.92–60.99] | 21.02 [20.58–22.19] |
+| 4.94% | 4 | 67.52 | 61.55 [60.03–63.68] | 21.78 [21.53–22.07] |
+| 49.95% | 1 | 70.14 | 60.56 [58.63–65.98] | 24.17 [23.99–25.54] |
+| 49.95% | 4 | 81.79 | 72.32 [71.44–73.02] | 25.65 [25.38–26.79] |
+| 100.00% | 1 | 76.64 | 66.17 [64.42–66.19] | 27.41 [26.88–27.84] |
+| 100.00% | 4 | 97.61 | 86.88 [84.87–90.81] | 29.21 [29.19–30.08] |
+
+### Snapshot reuse
+
+For the fixed resident API, the prediction compares the one-time load and first call plus one warm cost per subsequent call against repeated tuned native execution. The predicted threshold was two calls at both scales. The measured SF5 pair crossed at two. At SF1 two calls went both ways and three calls won all follow-up pairs. These are reuse tests of one query shape. The model and outputs are in `offload-crossover/`, including the supplementary SQL plans and the measured snapshot series.
+
 ## Interpretation and follow-up
 
 GFTR changes memory access after ordering. Aggregation still pays for sorting each transformed payload and for PostgreSQL tuple conversion. For join outputs, widening the payload makes the extra transformation worthwhile in the observed SF5 device-resident case. Retaining inputs and intermediates on the GPU avoids much larger copies in a narrow chain. The first SQL execution includes scanning, packing, upload and lookup construction.
@@ -195,3 +222,4 @@ The raw-results archive contains an index and SHA-256 manifest. Its directory na
 | `aggregation-operator/` | Synthetic resident aggregation ablation, measurement method and compile/run command |
 | `join-sql/` | Matched-settings SQL plans, exact checks, batch statistics and transfer bytes |
 | `join-residency/` | Resident CUDA trials, same-snapshot checks, SQL plans and crossover trials |
+| `offload-crossover/` | Calibration and held-out JSON plans, frozen predictions, model errors and snapshot reuse |
