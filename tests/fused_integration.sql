@@ -12,6 +12,7 @@ SET jit = off;
 CREATE TEMP TABLE fused_dim(id int PRIMARY KEY, grp int);
 CREATE TEMP TABLE fused_fact(id int, value int, grp int);
 CREATE TEMP TABLE fused_nonunique(id int, grp int);
+CREATE TEMP TABLE fused_empty(id int PRIMARY KEY, grp int);
 INSERT INTO fused_dim VALUES
     (-2147483648, NULL), (1, -2147483648), (2, -2147483648),
     (3, 2147483647), (4, 2147483647), (5, 5), (6, 0);
@@ -26,6 +27,7 @@ INSERT INTO fused_nonunique VALUES (1, 2), (1, 3);
 ANALYZE fused_dim;
 ANALYZE fused_fact;
 ANALYZE fused_nonunique;
+ANALYZE fused_empty;
 
 CREATE FUNCTION pg_temp.assert_fused(q text, expected boolean, native_only boolean DEFAULT false)
 RETURNS void LANGUAGE plpgsql AS $$
@@ -53,6 +55,14 @@ BEGIN
     ) THEN
         RAISE EXCEPTION 'fused join result mismatch for %', q;
     END IF;
+    IF EXISTS (
+        SELECT 1 FROM pg_attribute e JOIN pg_attribute a USING (attnum)
+        WHERE e.attrelid = 'fused_expected'::regclass
+          AND a.attrelid = 'fused_actual'::regclass
+          AND e.attnum > 0 AND e.atttypid <> a.atttypid
+    ) THEN
+        RAISE EXCEPTION 'fused join result type mismatch for %', q;
+    END IF;
     DROP TABLE fused_expected, fused_actual;
 END $$;
 
@@ -63,7 +73,7 @@ SELECT pg_temp.assert_fused(
 SELECT pg_temp.assert_fused(
     'SELECT d.grp, count(*) FROM fused_fact f JOIN fused_dim d USING (id) WHERE f.value > 40 GROUP BY d.grp', true);
 SELECT pg_temp.assert_fused(
-    'SELECT d.grp, count(*), sum(f.value) FROM fused_fact f JOIN fused_dim d USING (id) WHERE d.id = 99 GROUP BY d.grp', true);
+    'SELECT d.grp, count(*), sum(f.value) FROM fused_fact f JOIN fused_empty d USING (id) GROUP BY d.grp', true);
 SELECT pg_temp.assert_fused(
     'SELECT d.grp, count(*) FROM fused_fact f LEFT JOIN fused_dim d USING (id) GROUP BY d.grp', false, true);
 SELECT pg_temp.assert_fused(
