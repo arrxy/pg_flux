@@ -12,7 +12,7 @@ The host is PostgreSQL 18.6 on eight AMD EPYC vCPUs with an NVIDIA A100
 SXM4 80 GB and CUDA 12.6. The generated SF1 and SF5 datasets contain
 6,001,215 and 29,999,795 line items. The cases are TPC-H-derived SQL
 microbenchmarks. The native baseline uses the server's default planner
-settings, including two planned workers per Gather and 4 MiB `work_mem`.
+settings, including up to two workers per Gather and 4 MiB `work_mem`.
 The tuned native run uses 256 MiB `work_mem`.
 
 ```bash
