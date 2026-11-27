@@ -37,9 +37,36 @@ comparison. Auto mode offers the CUDA path at its provisional planner cost.
 | Orders, selective | 171.3 ms | 182.6 ms | 1,194.0 ms | 1,256.5 ms | 175.6 ms |
 | Supplier, bounded projection | 40.4 ms | 39.2 ms | 19.7 ms | 29.9 ms | 37.6 ms |
 
-On SF1, the grouped supplier query using the existing CUDA aggregate over
-a native join took 1,693.9 ms. The SF5 SQL measurements and fused prototype
-validation are in progress.
+| SF5 case | Native | Native tuned | Compact CPU | CUDA | Auto |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Supplier, grouped | 4,151.0 ms | 4,171.9 ms | 10,956.6 ms | 10,886.9 ms | 4,163.3 ms |
+| Part, payloads | 5,106.5 ms | 8,380.4 ms | 10,269.9 ms | 10,169.7 ms | 5,081.0 ms |
+| Orders, broad | 5,074.6 ms | 5,151.7 ms | 6,464.7 ms | 6,740.8 ms | 5,095.7 ms |
+| Orders, selective | 2,624.9 ms | 2,587.2 ms | 6,613.3 ms | 5,923.7 ms | 2,680.4 ms |
+| Supplier, bounded projection | 38.2 ms | 34.0 ms | 26.3 ms | 42.2 ms | 38.3 ms |
+
+All modes returned matching digests at both scales. The bounded supplier
+projection returns 40,278 rows. Compact CPU was 1.99× and 1.29× as fast as
+the faster native mode at SF1 and SF5, respectively. Forced CUDA improved
+the same query at SF1 by 24% and lost at SF5. Native execution won every
+broad and selective case. Auto chose native plans for all five workloads at
+both scales. These measurements do not support enabling acceleration by
+default or calibrating a broad GPU selection rule.
+
+The existing CUDA aggregation over a native join took 1,693.9 ms at SF1 and
+9,502.2 ms at SF5 on the grouped supplier query. The SF5 standalone CUDA
+join spent median 5,022 ms scanning and packing probe rows, approximately
+1,018 ms constructing output slots, and 3.9 ms in the probe kernel. It
+returned 119,999,184 bytes of match data to the host. The equivalent native
+plan could combine a parallel join with partial aggregation, which limited
+the number of rows it needed to return from the workers. The custom join
+feeds one PostgreSQL output tuple per match to the upper plan. Cutting
+per-tuple work is the priority for broad joins.
+
+## Fused supplier prototype
+
+The prototype validation is in progress.
+
 ## Cache and transfer experiment
 
 The host exposes 512 KiB L2 per vCPU and 16 MiB shared L3. The A100 reports
@@ -93,6 +120,6 @@ nvcc -O3 -std=c++17 -gencode arch=compute_80,code=sm_80 -Isrc \
   automatic selection. Include time-to-first-row for queries that can stop
   early, and run concurrency separately from isolated measurements.
 
-[Cuda data movement and coalescing](https://docs.nvidia.com/cuda/archive/12.6.0/cuda-c-best-practices-guide/index.html) ·
+[CUDA data movement and coalescing](https://docs.nvidia.com/cuda/archive/12.6.0/cuda-c-best-practices-guide/index.html) ·
 [CUDA L2 persistence](https://docs.nvidia.com/cuda/archive/12.6.0/cuda-c-programming-guide/index.html#l2-cache-set-aside-for-persisting-accesses) ·
 [GFTR research](https://arxiv.org/abs/2312.00720)
