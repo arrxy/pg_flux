@@ -91,13 +91,21 @@ def configure(args, mode):
     settings = [
         f"SET work_mem='{args.tuned_work_mem_mb}MB';"
         if mode == "native_tuned" else "RESET work_mem;",
-        f"SET pg_gftr.join_enabled={'on' if mode in CUSTOM_JOIN_MODES else 'off'};",
-        f"SET pg_gftr.join_force={'on' if mode in ('cpu', 'cuda') else 'off'};",
         f"SET pg_gftr.enabled={'on' if mode == 'native_gpu_agg' else 'off'};",
     ]
     if mode in CUSTOM_JOIN_MODES:
         backend = "cpu" if mode == "cpu" else "cuda"
-        settings.append(f"SET pg_gftr.join_backend='{backend}';")
+        settings += [
+            "SET pg_gftr.join_enabled=on;",
+            f"SET pg_gftr.join_force={'off' if mode == 'auto' else 'on'};",
+            f"SET pg_gftr.join_backend='{backend}';",
+        ]
+    else:
+        # Also run native and aggregate-only modes against pre-join builds.
+        settings.append(
+            "SELECT 'SET pg_gftr.join_enabled=off;' "
+            "WHERE current_setting('pg_gftr.join_enabled', true) IS NOT NULL \\gexec"
+        )
     return settings
 
 
@@ -109,7 +117,7 @@ def workload(args, database_number):
     uses_extension = any(mode not in ("native", "native_tuned") for mode in args.modes)
     script = [
         f"SET statement_timeout={args.statement_timeout_ms};",
-        "SET search_path=public,pg_catalog;",
+        "SET search_path=pg_catalog,public;",
     ]
     if uses_extension:
         script += ["LOAD 'pg_gftr';", f"SET pg_gftr.device={args.device};"]
@@ -258,7 +266,10 @@ def main():
         print(f"Running database {number + 1}; artifacts in {output}", flush=True)
         try:
             report = run_database(args, dbname, number, output)
-        except (OSError, subprocess.CalledProcessError, ValueError, KeyError) as error:
+        except subprocess.CalledProcessError as error:
+            raise SystemExit(f"psql exited with status {error.returncode}; see "
+                             f"{output / 'stderr.txt'}") from None
+        except (OSError, ValueError, KeyError) as error:
             raise SystemExit(f"Benchmark failed: {error}; see {output}") from error
         for case, modes in report["measurements"].items():
             summary = ", ".join(f"{mode} {result['median_ms']:.1f} ms"
