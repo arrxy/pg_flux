@@ -33,8 +33,22 @@ FROM lineitem l JOIN supplier s ON l.l_suppkey = s.s_suppkey
 WHERE l.l_orderkey BETWEEN 1 AND 40000
 ORDER BY l.l_orderkey, l.l_linenumber""",
 }
-MODES = ("native", "native_tuned", "cpu", "cuda", "native_gpu_agg", "auto")
-CUSTOM_JOIN_MODES = ("cpu", "cuda", "auto")
+PREAGG_SUPPLIER_QUERY = """
+SELECT s.s_nationkey,
+       sum(l.line_count)::bigint AS count,
+       sum(l.line_number_sum)::bigint AS sum
+FROM (
+    SELECT l_suppkey, count(*) AS line_count, sum(l_linenumber) AS line_number_sum
+    FROM lineitem
+    GROUP BY l_suppkey
+) l JOIN supplier s ON l.l_suppkey = s.s_suppkey
+GROUP BY s.s_nationkey
+ORDER BY s.s_nationkey"""
+MODES = ("native", "native_tuned", "cpu", "cuda", "native_gpu_agg", "auto",
+         "fused_cpu", "native_preagg")
+CUSTOM_JOIN_MODES = ("cpu", "cuda", "auto", "fused_cpu")
+GROUPED_MODES = ("native_gpu_agg", "fused_cpu", "native_preagg")
+NATIVE_MODES = ("native", "native_tuned", "native_preagg")
 RECORD = re.compile(r"^GFTR_JOIN_RECORD (\w+)$", re.MULTILINE)
 SETTINGS = (
     "server_version",
@@ -60,7 +74,11 @@ def arguments():
     parser.add_argument("--warmups", type=int, default=1)
     parser.add_argument("--seed", type=int, default=714)
     parser.add_argument("--statement-timeout-ms", type=int, default=300_000)
-    parser.add_argument("--serial", action="store_true", help="disable plan parallelism")
+    parallelism = parser.add_mutually_exclusive_group()
+    parallelism.add_argument("--serial", action="store_true", help="disable plan parallelism")
+    parallelism.add_argument("--native-worker-sweep", nargs="+", type=int,
+                             metavar="N", help="benchmark each native mode with each limit "
+                             "for max_parallel_workers_per_gather, e.g. 0 2 4")
     parser.add_argument("--disable-jit", action="store_true")
     parser.add_argument("--tuned-work-mem-mb", type=int, default=256)
     parser.add_argument("--join-batch-rows", type=int, default=131_072)
@@ -77,24 +95,52 @@ def arguments():
         parser.error("invalid trial count, device, memory budget, batch size or timeout")
     if len(set(args.modes)) != len(args.modes) or len(set(args.cases)) != len(args.cases):
         parser.error("each mode and case may appear only once")
+    if args.native_worker_sweep is not None:
+        workers = args.native_worker_sweep
+        if min(workers) < 0 or len(set(workers)) != len(workers):
+            parser.error("--native-worker-sweep requires distinct nonnegative worker counts")
+        if not set(args.modes).intersection(NATIVE_MODES):
+            parser.error("--native-worker-sweep requires a native mode")
     if not any(case_modes(args, case) for case in args.cases):
-        parser.error("native_gpu_agg is applicable to supplier_grouped only")
+        parser.error(f"{', '.join(GROUPED_MODES)} apply to supplier_grouped only")
     return args
 
 
 def case_modes(args, case):
     return [mode for mode in args.modes
-            if mode != "native_gpu_agg" or case == "supplier_grouped"]
+            if mode not in GROUPED_MODES or case == "supplier_grouped"]
 
 
-def configure(args, mode):
+def mode_variants(args, case):
+    variants = {}
+    for mode in case_modes(args, case):
+        if mode in NATIVE_MODES and args.native_worker_sweep is not None:
+            for workers in args.native_worker_sweep:
+                variants[f"{mode}_w{workers}"] = (mode, workers)
+        else:
+            variants[mode] = (mode, None)
+    return variants
+
+
+def query_for_mode(case, mode):
+    # The rewrite combines partial aggregates over each supplier key. Both
+    # outer casts preserve the original COUNT(*) and SUM(integer) types.
+    return PREAGG_SUPPLIER_QUERY if mode == "native_preagg" else QUERIES[case]
+
+
+def configure(args, mode, workers=None):
     settings = [
         f"SET work_mem='{args.tuned_work_mem_mb}MB';"
         if mode == "native_tuned" else "RESET work_mem;",
         f"SET pg_gftr.enabled={'on' if mode == 'native_gpu_agg' else 'off'};",
     ]
+    if args.native_worker_sweep is not None:
+        if workers is None:
+            settings.append("RESET max_parallel_workers_per_gather;")
+        else:
+            settings.append(f"SET max_parallel_workers_per_gather={workers};")
     if mode in CUSTOM_JOIN_MODES:
-        backend = "cpu" if mode == "cpu" else "cuda"
+        backend = "cpu" if mode in ("cpu", "fused_cpu") else "cuda"
         settings += [
             "SET pg_gftr.join_enabled=on;",
             f"SET pg_gftr.join_force={'off' if mode == 'auto' else 'on'};",
@@ -106,6 +152,14 @@ def configure(args, mode):
             "SELECT 'SET pg_gftr.join_enabled=off;' "
             "WHERE current_setting('pg_gftr.join_enabled', true) IS NOT NULL \\gexec"
         )
+    if mode == "fused_cpu":
+        settings += ["SET pg_gftr.fused_enabled=on;", "SET pg_gftr.fused_force=on;"]
+    else:
+        # Older builds have no fused GUC. Native and existing modes still work.
+        settings.append(
+            "SELECT 'SET pg_gftr.fused_enabled=off;' "
+            "WHERE current_setting('pg_gftr.fused_enabled', true) IS NOT NULL \\gexec"
+        )
     return settings
 
 
@@ -114,7 +168,7 @@ def record(name):
 
 
 def workload(args, database_number):
-    uses_extension = any(mode not in ("native", "native_tuned") for mode in args.modes)
+    uses_extension = any(mode not in NATIVE_MODES for mode in args.modes)
     script = [
         f"SET statement_timeout={args.statement_timeout_ms};",
         "SET search_path=pg_catalog,public;",
@@ -147,29 +201,30 @@ def workload(args, database_number):
         f"'settings', (SELECT json_object_agg(name, current_setting(name)) "
         f"FROM pg_settings WHERE name IN ({keys})));",
     ]
-    cases = {case: case_modes(args, case) for case in args.cases if case_modes(args, case)}
+    cases = {case: mode_variants(args, case) for case in args.cases if case_modes(args, case)}
     verification = {}
-    for case, modes in cases.items():
-        verify_modes = list(dict.fromkeys(["native", *modes]))
-        verification[case] = verify_modes
-        for mode in verify_modes:
-            script += configure(args, mode)
-            script += [record(f"result_{case}_{mode}"), f"{QUERIES[case]};"]
+    for case, variants in cases.items():
+        verify_variants = {"native": ("native", None), **variants}
+        verification[case] = list(verify_variants)
+        for label, (mode, workers) in verify_variants.items():
+            script += configure(args, mode, workers)
+            script += [record(f"result_{case}_{label}"), f"{query_for_mode(case, mode)};"]
 
     schedule = []
     rng = random.Random(args.seed + database_number)
     for trial in range(args.warmups + args.trials):
-        order = [(case, mode) for case, modes in cases.items() for mode in modes]
+        order = [(case, label) for case, variants in cases.items() for label in variants]
         rng.shuffle(order)
-        for case, mode in order:
-            name = f"plan_{trial}_{case}_{mode}"
-            schedule.append((trial, case, mode, name))
-            script += configure(args, mode)
+        for case, label in order:
+            mode, workers = cases[case][label]
+            name = f"plan_{trial}_{case}_{label}"
+            schedule.append((trial, case, label, name))
+            script += configure(args, mode, workers)
             script += [record(name),
                        "EXPLAIN (ANALYZE, BUFFERS, SETTINGS, TIMING OFF, FORMAT JSON)"
-                       f" {QUERIES[case]};"]
+                       f" {query_for_mode(case, mode)};"]
     script.append("COMMIT;")
-    return "\n".join(script) + "\n", verification, schedule
+    return "\n".join(script) + "\n", cases, verification, schedule
 
 
 def walk_nodes(node):
@@ -183,20 +238,35 @@ def check_plan(plan, case, mode):
     joins = [node for node in nodes if node.get("Custom Plan Provider") == "GftrJoin"]
     aggregations = [node for node in nodes
                     if node.get("Custom Plan Provider") == "GftrAggregate"]
-    if mode != "auto" and len(joins) != int(mode in ("cpu", "cuda")):
+    fused = [node for node in nodes
+             if node.get("Custom Plan Provider") == "GftrFusedJoinAggregate"]
+    if len(fused) != int(mode == "fused_cpu"):
+        raise ValueError(f"{case}/{mode} expected a different number of GftrFusedJoinAggregate nodes")
+    if mode != "auto" and len(joins) != int(mode in ("cpu", "cuda", "fused_cpu")):
         raise ValueError(f"{case}/{mode} expected a different number of GftrJoin nodes")
     if len(aggregations) != int(mode == "native_gpu_agg"):
         raise ValueError(f"{case}/{mode} expected a different number of GftrAggregate nodes")
     native_joins = [node for node in nodes if "Join Type" in node and node not in joins]
     if not joins and not native_joins:
         raise ValueError(f"{case}/{mode} has no join node")
+    if mode == "native_preagg" and not any(
+        child.get("Node Type") == "Aggregate"
+        for join in native_joins
+        for branch in join.get("Plans", [])
+        for child in walk_nodes(branch)
+    ):
+        raise ValueError(f"{case}/{mode} has no aggregate below a native join")
     for node in joins:
         backend = str(node.get("Backend", "")).lower()
-        expected = "cpu" if mode == "cpu" else "cuda"
+        expected = "cpu" if mode in ("cpu", "fused_cpu") else "cuda"
         if expected not in backend:
             raise ValueError(f"{case}/{mode} expected the {expected} backend, got {backend!r}")
     return [{key: value for key, value in node.items() if key != "Plans"}
-            for node in [*joins, *aggregations, *native_joins]]
+            for node in [*fused, *joins, *aggregations, *native_joins]]
+
+
+def count_workers(plan, field):
+    return sum(node.get(field, 0) for node in walk_nodes(plan["Plan"]))
 
 
 def summarize(samples):
@@ -205,12 +275,14 @@ def summarize(samples):
         "median_ms": statistics.median(sample["Execution Time"] for sample in samples),
         "min_ms": min(sample["Execution Time"] for sample in samples),
         "max_ms": max(sample["Execution Time"] for sample in samples),
+        "workers_planned": [count_workers(sample, "Workers Planned") for sample in samples],
+        "workers_launched": [count_workers(sample, "Workers Launched") for sample in samples],
     }
 
 
 def run_database(args, dbname, database_number, output):
     output.mkdir()
-    script, verification, schedule = workload(args, database_number)
+    script, cases, verification, schedule = workload(args, database_number)
     sql_path = output / "workload.sql"
     sql_path.write_text(script)
     stdout_path = output / "stdout.txt"
@@ -226,15 +298,17 @@ def run_database(args, dbname, database_number, output):
                for mode in modes}
         for case, modes in verification.items()
     }
-    samples = {case: {mode: [] for mode in case_modes(args, case)} for case in verification}
+    samples = {case: {label: [] for label in variants} for case, variants in cases.items()}
     plans = []
-    for trial, case, mode, name in schedule:
+    for trial, case, label, name in schedule:
+        mode, workers = cases[case][label]
         plan, = json.loads(records[name])
         operators = check_plan(plan, case, mode)
         warmup = trial < args.warmups
         if not warmup:
-            samples[case][mode].append(plan)
-        plans.append({"trial": trial + 1, "warmup": warmup, "case": case, "mode": mode,
+            samples[case][label].append(plan)
+        plans.append({"trial": trial + 1, "warmup": warmup, "case": case, "mode": label,
+                      "worker_limit": 0 if args.serial else workers,
                       "operators": operators, "explain": plan})
     for case, values in hashes.items():
         if len(set(values.values())) != 1:
@@ -252,6 +326,10 @@ def run_database(args, dbname, database_number, output):
                    "Includes SQL execution and accelerator transfers; excludes normal "
                    "result delivery. Result digests are collected outside measured trials."),
     }
+    if "native_preagg" in args.modes and "supplier_grouped" in verification:
+        report["query_overrides"] = {"native_preagg": {
+            "supplier_grouped": PREAGG_SUPPLIER_QUERY.strip(),
+        }}
     (output / "report.json").write_text(json.dumps(report, indent=2) + "\n")
     return report
 
