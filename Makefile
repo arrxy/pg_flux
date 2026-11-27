@@ -32,7 +32,6 @@ src/gftr_join_cuda.o: src/gftr_join_cuda.cu src/gftr_join.h src/gftr_backend.h s
 	$(NVCC) $(NVCCFLAGS) -Xcompiler=-fPIC -gencode arch=compute_$(CUDA_ARCH),code=sm_$(CUDA_ARCH) -gencode arch=compute_$(CUDA_ARCH),code=compute_$(CUDA_ARCH) -Isrc -c $< -o $@
 
 src/pg_gftr.o src/pg_gftr_join.o src/gftr_join_cuda_stub.o: src/gftr_join.h
-src/gftr_join_cpu.o: src/gftr_join_lookup.h
 src/pg_gftr.o src/pg_gftr_join.o src/gftr_cpu.o src/gftr_cuda_stub.o src/gftr_join_cuda_stub.o: src/gftr_backend.h
 
 .PHONY: test-cpu test-cuda
