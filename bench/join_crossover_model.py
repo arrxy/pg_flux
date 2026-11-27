@@ -181,7 +181,8 @@ def snapshot_reuse(directory):
             native_log = directory / f"{scale}-native-series-{tail}"
             pattern = r"Execution Time: ([0-9.]+) ms"
             resident_times = re.findall(pattern, resident_log.read_text())
-            native_times = re.findall(pattern, native_log.read_text())
+            # Follow-up native scripts warm the query once before measuring.
+            native_times = re.findall(pattern, native_log.read_text())[1:]
             if len(resident_times) != count + 1 or len(native_times) != count:
                 raise ValueError(f"unexpected number of EXPLAIN timings in {tail}")
             sessions.setdefault(count, []).append((sum(map(float, resident_times)),
