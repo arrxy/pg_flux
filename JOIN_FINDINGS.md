@@ -54,7 +54,7 @@ both scales. These measurements do not support enabling acceleration by
 default or calibrating a broad GPU selection rule.
 
 The existing CUDA aggregation over a native join took 1,693.9 ms at SF1 and
-9,502.2 ms at SF5 on the grouped supplier query. The SF5 standalone CUDA
+9,502.2 ms at SF5 on the grouped supplier query. The SF5 PostgreSQL CUDA
 join spent median 5,022 ms scanning and packing probe rows, approximately
 1,018 ms constructing output slots, and 3.9 ms in the probe kernel. It
 returned 119,999,184 bytes of match data to the host. The equivalent native
@@ -65,7 +65,32 @@ per-tuple work is the priority for broad joins.
 
 ## Fused supplier prototype
 
-The prototype validation is in progress.
+The standalone prototype uses the TPC-H supplier-to-nation mapping and
+returns the 25 groups for `COUNT(*)` and `SUM(l_linenumber)`. A GPU kernel
+looks up each supplier and accumulates into per-warp histograms. The dimension
+stays on the GPU across trials. Every trial matched the compact CPU result,
+and both scales matched native SQL output byte for byte.
+
+| Scale | Compact CPU | Fused CUDA | Fact H2D | GPU kernel | Result D2H |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| SF1 | 9.7 ms | 62.4 ms | 59.8 ms | 0.075 ms | 2.462 ms |
+| SF5 | 53.2 ms | 153.6 ms | 152.1 ms | 0.337 ms | 0.023 ms |
+
+These are seven warm operator medians using already parsed host arrays.
+File reading and decoding took about 584 ms at SF1 and 3,461 ms at SF5.
+Initial GPU setup took about 314 ms and 397 ms, respectively. The CUDA
+operator uploads about 48 MB and 240 MB of fact columns before returning
+400 bytes at either scale. Fusion removes the large match transfer and
+PostgreSQL output slots from this experiment. The compact CPU operation
+still wins when the facts start on the host. A PostgreSQL fusion path is
+future work, with parallel packing or an already device-resident input as
+the most useful next comparison.
+
+```bash
+nvcc -O3 -std=c++17 -gencode arch=compute_80,code=sm_80 bench/fused_supplier.cu   -o /tmp/fused-supplier
+/tmp/fused-supplier /home/ubuntu/tpch/data/sf1 7 >sf1-groups.txt 2>sf1-fused.csv
+/tmp/fused-supplier /home/ubuntu/tpch/data/sf5 7 >sf5-groups.txt 2>sf5-fused.csv
+```
 
 ## Cache and transfer experiment
 
