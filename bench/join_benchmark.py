@@ -33,10 +33,22 @@ FROM lineitem l JOIN supplier s ON l.l_suppkey = s.s_suppkey
 WHERE l.l_orderkey BETWEEN 1 AND 40000
 ORDER BY l.l_orderkey, l.l_linenumber""",
 }
-MODES = ("native", "native_tuned", "cpu", "cuda", "native_gpu_agg", "auto", "fused_cpu")
+PREAGG_SUPPLIER_QUERY = """
+SELECT s.s_nationkey,
+       sum(l.line_count)::bigint AS count,
+       sum(l.line_number_sum)::bigint AS sum
+FROM (
+    SELECT l_suppkey, count(*) AS line_count, sum(l_linenumber) AS line_number_sum
+    FROM lineitem
+    GROUP BY l_suppkey
+) l JOIN supplier s ON l.l_suppkey = s.s_suppkey
+GROUP BY s.s_nationkey
+ORDER BY s.s_nationkey"""
+MODES = ("native", "native_tuned", "cpu", "cuda", "native_gpu_agg", "auto",
+         "fused_cpu", "native_preagg")
 CUSTOM_JOIN_MODES = ("cpu", "cuda", "auto", "fused_cpu")
-GROUPED_MODES = ("native_gpu_agg", "fused_cpu")
-NATIVE_MODES = ("native", "native_tuned")
+GROUPED_MODES = ("native_gpu_agg", "fused_cpu", "native_preagg")
+NATIVE_MODES = ("native", "native_tuned", "native_preagg")
 RECORD = re.compile(r"^GFTR_JOIN_RECORD (\w+)$", re.MULTILINE)
 SETTINGS = (
     "server_version",
@@ -88,9 +100,9 @@ def arguments():
         if min(workers) < 0 or len(set(workers)) != len(workers):
             parser.error("--native-worker-sweep requires distinct nonnegative worker counts")
         if not set(args.modes).intersection(NATIVE_MODES):
-            parser.error("--native-worker-sweep requires native or native_tuned mode")
+            parser.error("--native-worker-sweep requires a native mode")
     if not any(case_modes(args, case) for case in args.cases):
-        parser.error("native_gpu_agg and fused_cpu are applicable to supplier_grouped only")
+        parser.error(f"{', '.join(GROUPED_MODES)} apply to supplier_grouped only")
     return args
 
 
@@ -108,6 +120,12 @@ def mode_variants(args, case):
         else:
             variants[mode] = (mode, None)
     return variants
+
+
+def query_for_mode(case, mode):
+    # The rewrite combines partial aggregates over each supplier key. Both
+    # outer casts preserve the original COUNT(*) and SUM(integer) types.
+    return PREAGG_SUPPLIER_QUERY if mode == "native_preagg" else QUERIES[case]
 
 
 def configure(args, mode, workers=None):
@@ -190,7 +208,7 @@ def workload(args, database_number):
         verification[case] = list(verify_variants)
         for label, (mode, workers) in verify_variants.items():
             script += configure(args, mode, workers)
-            script += [record(f"result_{case}_{label}"), f"{QUERIES[case]};"]
+            script += [record(f"result_{case}_{label}"), f"{query_for_mode(case, mode)};"]
 
     schedule = []
     rng = random.Random(args.seed + database_number)
@@ -204,7 +222,7 @@ def workload(args, database_number):
             script += configure(args, mode, workers)
             script += [record(name),
                        "EXPLAIN (ANALYZE, BUFFERS, SETTINGS, TIMING OFF, FORMAT JSON)"
-                       f" {QUERIES[case]};"]
+                       f" {query_for_mode(case, mode)};"]
     script.append("COMMIT;")
     return "\n".join(script) + "\n", cases, verification, schedule
 
@@ -231,6 +249,13 @@ def check_plan(plan, case, mode):
     native_joins = [node for node in nodes if "Join Type" in node and node not in joins]
     if not joins and not native_joins:
         raise ValueError(f"{case}/{mode} has no join node")
+    if mode == "native_preagg" and not any(
+        child.get("Node Type") == "Aggregate"
+        for join in native_joins
+        for branch in join.get("Plans", [])
+        for child in walk_nodes(branch)
+    ):
+        raise ValueError(f"{case}/{mode} has no aggregate below a native join")
     for node in joins:
         backend = str(node.get("Backend", "")).lower()
         expected = "cpu" if mode in ("cpu", "fused_cpu") else "cuda"
@@ -301,6 +326,10 @@ def run_database(args, dbname, database_number, output):
                    "Includes SQL execution and accelerator transfers; excludes normal "
                    "result delivery. Result digests are collected outside measured trials."),
     }
+    if "native_preagg" in args.modes and "supplier_grouped" in verification:
+        report["query_overrides"] = {"native_preagg": {
+            "supplier_grouped": PREAGG_SUPPLIER_QUERY.strip(),
+        }}
     (output / "report.json").write_text(json.dumps(report, indent=2) + "\n")
     return report
 
