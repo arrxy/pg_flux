@@ -70,7 +70,7 @@ def arguments():
     parser.add_argument("--dbname", nargs="+", default=["tpch_sf1", "tpch_sf5"],
                         help="database names or libpq connection strings, in run order")
     parser.add_argument("--cases", choices=QUERIES, nargs="+", default=list(QUERIES))
-    parser.add_argument("--modes", choices=MODES, nargs="+", default=list(MODES[:4]))
+    parser.add_argument("--modes", choices=MODES, nargs="+", default=["native", "native_tuned", "cpu"])
     parser.add_argument("--trials", type=int, default=3)
     parser.add_argument("--warmups", type=int, default=1)
     parser.add_argument("--seed", type=int, default=714)
