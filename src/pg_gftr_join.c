@@ -639,7 +639,7 @@ pg_gftr_fused_reduce(CustomScanState *join, AttrNumber group_attno,
 	JoinInput *build = &state->inputs[JOIN_BUILD];
 	JoinInput *probe = &state->inputs[JOIN_PROBE];
 	int group_column;
-	int key_idx = probe->key_attno - 1;
+	int key_idx;
 	int sum_idx = -1;
 	int max_attno;
 	size_t remaining_host;
@@ -663,6 +663,8 @@ pg_gftr_fused_reduce(CustomScanState *join, AttrNumber group_attno,
 		elog(ERROR, "pg_gftr fused join has already been consumed");
 
 	state->backend = JOIN_CPU;
+	state->probe_bytes = 0;
+	key_idx = probe->key_attno - 1;
 	group_column = state->outputs[group_attno - 1].column;
 	if (sum_attno)
 	{
