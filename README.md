@@ -26,7 +26,7 @@ reproduction of all their experiments.
   IDs and reads original payloads through the resulting map.
 - Explicit CPU reference backend for local correctness testing.
 
-GPU joins, hash/partitioned aggregation, dictionary encoding, multiple group
+Hash/partitioned aggregation, dictionary encoding, multiple group
 keys, expression group keys/aggregate arguments, `bigint`/numeric/text keys or
 payloads, global aggregation without GROUP BY, HAVING, FILTER, DISTINCT
 aggregates, ordered aggregates, grouping sets, window queries and partitionwise
@@ -121,6 +121,35 @@ configured preload library. No server restart is needed for session `LOAD`.
 Installing extension SQL objects alone does not load hooks into other sessions.
 `enabled` defaults to off. `force` defaults to off. There is no silent CPU
 fallback when a selected CUDA path fails.
+
+## CUDA joins
+
+The opt-in CUDA join supports read-only inner joins on one built-in
+`integer` equality between ordinary tables when PostgreSQL proves the
+build side unique. PostgreSQL child plans apply base filters and use the
+query snapshot. The build lookup stays on the GPU during probe batches.
+
+```sql
+LOAD 'pg_gftr';
+SET pg_gftr.join_enabled = on;
+SET pg_gftr.join_force = on;  -- force an eligible path for comparison
+SET pg_gftr.join_result_mode = 'auto';
+
+EXPLAIN (ANALYZE, BUFFERS)
+SELECT count(*), sum(l.l_partkey)
+FROM lineitem l JOIN orders o ON l.l_orderkey = o.o_orderkey
+WHERE o.o_orderdate >= DATE '1995-01-01'
+  AND o.o_orderdate < DATE '1995-02-01';
+```
+
+`join_result_mode` accepts `auto`, `dense`, and `compact`. Auto requests
+compaction for plans estimated to match less than 10% of probe rows. The
+GPU stages at most one match pair per eight configured batch rows. A
+batch uses its dense result if the pairs exceed that capacity, compaction
+would use more bytes, or the device budget only fits dense buffers.
+PostgreSQL reconstructs the index vector in probe order. EXPLAIN reports
+whether compaction was requested, actual dense and compact batch counts,
+and the number of bytes transferred.
 
 ## Planner and memory controls
 
